@@ -1,26 +1,52 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <shlwapi.h> // For PathRemoveFileSpecA
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <stdint.h>
+#include <stdint.h> // Include stdint.h for uint32_t
 #include <stdbool.h>
 #include <time.h>
 #include <errno.h> // Добавлено для strerror
-#include <math.h>  // Для fmin
+#include <math.h>  // Для fmin, abs
+#include <limits.h> // Для INT_MAX
+
+// Define _GNU_SOURCE or similar if strndup is needed and not available
+// For MinGW, defining it explicitly often helps.
+#define _GNU_SOURCE
+#include <string.h> // Ensure string.h is included after macro definition
+
+
+// --- НОВЫЕ ЗАГОЛОВКИ ДЛЯ PNG ---
+#include <png.h>
+#include <setjmp.h>
+// --- КОНЕЦ НОВЫХ ЗАГОЛОВКОВ ---
+
 #define MAX_LINES 8192
 #define MAX_LINE 4096
 #define MAX_VARS 1024
 #define MAX_PATH_LEN MAX_PATH
+
 /* ---------------- Types ---------------- */
+// --- НОВАЯ СТРУКТУРА ДЛЯ ВНУТРЕННЕГО ИЗОБРАЖЕНИЯ ---
+typedef struct {
+    uint32_t *pixels; // Массив RGBA пикселей (0xAABBGGRR на Windows x86)
+    int w, h;
+} RGBAImage;
+// --- КОНЕЦ НОВОЙ СТРУКТУРЫ ---
+
 typedef enum { VAR_INT = 0, VAR_STRING = 1, VAR_IMAGE = 2 } VarType;
 typedef struct {
     char *b64;           // base64 image data (allocated)
     int w, h;
     char path[MAX_PATH_LEN]; // relative path after save
     int saved;           // 0/1
+    // --- ДОБАВЛЕНО: внутреннее представление ---
+    RGBAImage *internal_img;
+    // --- КОНЕЦ ДОБАВЛЕНИЯ ---
 } Image;
+
 typedef struct {
     char name[128];
     VarType type;
@@ -28,6 +54,7 @@ typedef struct {
     char sv[32768];
     Image img;
 } Var;
+
 /* ---------------- Globals ---------------- */
 char *lines[MAX_LINES];
 int line_count = 0;
@@ -36,9 +63,11 @@ int var_count = 0;
 char context_str[8192] = "";
 char base_dir[MAX_PATH_LEN] = "";
 char api_server[256] = "http://localhost:5001"; // Default KoboldCpp server
+
 /// Simple demo array (strings)
 char *demo_array[128];
 int demo_array_len = 0;
+
 /* ---------------- Utilities ---------------- */
 static char *safe_strdup(const char *s) {
     if (!s) return NULL;
@@ -48,6 +77,7 @@ static char *safe_strdup(const char *s) {
     memcpy(r, s, n + 1);
     return r;
 }
+
 char *trim(char *s) {
     if (!s) return s;
     while (*s && isspace((unsigned char)*s)) s++;
@@ -55,9 +85,11 @@ char *trim(char *s) {
     while (e >= s && isspace((unsigned char)*e)) { *e = 0; e--; }
     return s;
 }
+
 int starts_with(const char *s, const char *p) {
     return s && p && strncmp(s, p, strlen(p)) == 0;
 }
+
 Var* get_var(const char *name) {
     if (!name) return NULL;
     for (int i = 0; i < var_count; ++i) {
@@ -65,6 +97,7 @@ Var* get_var(const char *name) {
     }
     return NULL;
 }
+
 int find_var_index(const char *name) {
     if (!name) return -1;
     for (int i = 0; i < var_count; ++i) {
@@ -72,6 +105,7 @@ int find_var_index(const char *name) {
     }
     return -1;
 }
+
 Var* create_var_if_missing(const char *name) {
     Var *v = get_var(name);
     if (v) return v;
@@ -86,8 +120,10 @@ Var* create_var_if_missing(const char *name) {
     v->img.w = v->img.h = 0;
     v->img.saved = 0;
     v->img.path[0] = 0;
+    v->img.internal_img = NULL; // Инициализация
     return v;
 }
+
 /* ---------------- Escaping / Unescaping ---------------- */
 /* JSON-escape (for building JSON safely) */
 void json_escape(const char *src, char *dst, int dstlen) {
@@ -121,6 +157,7 @@ void json_escape(const char *src, char *dst, int dstlen) {
     }
     *d = 0;
 }
+
 /* Unescape sequences into dst (size aware) */
 void unescape_inplace(const char *src, char *dst, size_t dstlen) {
     if (!src || !dst || dstlen == 0) {
@@ -144,6 +181,7 @@ void unescape_inplace(const char *src, char *dst, size_t dstlen) {
     }
     *d = 0;
 }
+
 /* ---------------- f-string implementation ----------------
 Поддержка подстановки {name} при рендеринге строки.
 Для записи литеральной '{' и '}' в шаблон используйте '\{' и '\}'.
@@ -172,6 +210,7 @@ const char *var_to_string(const Var *v, char *buf, size_t buflen) {
     buf[0] = 0;
     return buf;
 }
+
 /* keys, values arrays: if a placeholder name found in keys -> use values[i].
 otherwise attempt to find variable with that name in vars[].
 */
@@ -234,6 +273,7 @@ void render_fstring_with_map(const char *fmt, const char **keys, const char **va
     }
     *d = 0;
 }
+
 /* ---------------- Files & Directories ---------------- */
 void make_dirs_for_path(const char *fullpath) {
     if (!fullpath) return;
@@ -254,6 +294,7 @@ void make_dirs_for_path(const char *fullpath) {
         }
     }
 }
+
 /* Normalize relative path (remove leading slashes, convert / to \) */
 void normalize_relpath(char *dst, size_t dstlen, const char *rel) {
     if (!dst || !rel) return;
@@ -270,6 +311,7 @@ void normalize_relpath(char *dst, size_t dstlen, const char *rel) {
     }
     dst[j] = 0;
 }
+
 /* ---------------- Exec command ---------------- */
 void exec_cmd_capture(const char *cmd, char *outbuf, int outbufsz) {
     SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
@@ -310,6 +352,7 @@ void exec_cmd_capture(const char *cmd, char *outbuf, int outbufsz) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 }
+
 /* ---------------- File write helpers ---------------- */
 void write_utf8_file(const char *name, const char *data) {
     FILE *f = fopen(name, "wb");
@@ -317,6 +360,333 @@ void write_utf8_file(const char *name, const char *data) {
     fwrite(data, 1, strlen(data), f);
     fclose(f);
 }
+
+// --- НОВАЯ ФУНКЦИЯ: ОСВОБОЖДЕНИЕ RGBAImage ---
+void free_rgba_image(RGBAImage *img) {
+    if (img && img->pixels) {
+        free(img->pixels);
+        img->pixels = NULL;
+        img->w = 0;
+        img->h = 0;
+    }
+}
+// --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+// --- НОВАЯ СТРУКТУРА ДЛЯ ХРАНЕНИЯ ДАННЫХ ЧТЕНИЯ PNG ИЗ ПАМЯТИ ---
+struct mem_read_struct {
+    unsigned char *data;
+    size_t offset;
+    size_t size;
+};
+// --- КОНЕЦ НОВОЙ СТРУКТУРЫ ---
+
+// --- НОВАЯ ФУНКЦИЯ ЧТЕНИЯ ДЛЯ PNG ИЗ ПАМЯТИ ---
+void png_mem_read_data(png_structp png_ptr, png_bytep data, png_size_t length) {
+    struct mem_read_struct *src = (struct mem_read_struct *)png_get_io_ptr(png_ptr);
+    if (src->offset + length > src->size) {
+        png_error(png_ptr, "Read Error: Out of bounds");
+        return;
+    }
+    memcpy(data, src->data + src->offset, length);
+    src->offset += length;
+}
+// --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+// --- НОВАЯ ФУНКЦИЯ: ДЕКОДИРОВАНИЕ PNG ИЗ ПАМЯТИ ---
+int decode_png_from_memory(unsigned char *in_data, size_t in_len, RGBAImage *out_img) {
+    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) {
+        fprintf(stderr, "PNG: Could not init png read struct\n");
+        return 0;
+    }
+
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) {
+        fprintf(stderr, "PNG: Could not init png info struct\n");
+        png_destroy_read_struct(&png_ptr, NULL, NULL);
+        return 0;
+    }
+
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        fprintf(stderr, "PNG: Error during read\n");
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+        return 0;
+    }
+
+    // Установка источника данных
+    struct mem_read_struct mem_src;
+    mem_src.data = in_data;
+    mem_src.offset = 0;
+    mem_src.size = in_len;
+
+    png_set_read_fn(png_ptr, &mem_src, png_mem_read_data);
+
+    png_read_info(png_ptr, info_ptr);
+
+    png_uint_32 width, height;
+    int bit_depth, color_type, interlace_type;
+    png_get_IHDR(png_ptr, info_ptr, &width, &height, &bit_depth, &color_type, &interlace_type, NULL, NULL);
+
+    // Установка параметров для получения RGBA
+    if (color_type == PNG_COLOR_TYPE_PALETTE) {
+        png_set_palette_to_rgb(png_ptr);
+    }
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) {
+        png_set_expand_gray_1_2_4_to_8(png_ptr);
+    }
+    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) {
+        png_set_tRNS_to_alpha(png_ptr);
+    }
+    if (bit_depth == 16) {
+        png_set_strip_16(png_ptr);
+    }
+    png_set_filler(png_ptr, 0xff, PNG_FILLER_AFTER); // Ensure alpha channel exists
+
+    png_read_update_info(png_ptr, info_ptr);
+
+    // Выделение памяти и чтение строк
+    size_t rowbytes = png_get_rowbytes(png_ptr, info_ptr);
+    out_img->pixels = (uint32_t*)malloc(width * height * sizeof(uint32_t));
+    if (!out_img->pixels) {
+        fprintf(stderr, "PNG: Could not allocate pixel memory\n");
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+        return 0;
+    }
+    out_img->w = width;
+    out_img->h = height;
+
+    png_bytep *row_pointers = (png_bytep*)malloc(height * sizeof(png_bytep));
+    if (!row_pointers) {
+         fprintf(stderr, "PNG: Could not allocate row pointers memory\n");
+         free(out_img->pixels);
+         out_img->pixels = NULL;
+         png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+         return 0;
+    }
+    for (int y = 0; y < height; y++) {
+        row_pointers[y] = (png_bytep)(out_img->pixels + y * width);
+    }
+    png_read_image(png_ptr, row_pointers);
+    free(row_pointers);
+
+    png_read_end(png_ptr, info_ptr);
+    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+    return 1;
+}
+// --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+// --- НОВАЯ СТРУКТУРА ДЛЯ ХРАНЕНИЯ ДАННЫХ ЗАПИСИ PNG В ПАМЯТЬ ---
+struct mem_write_struct {
+    unsigned char *data;
+    size_t size;
+    size_t alloc_size;
+};
+// --- КОНЕЦ НОВОЙ СТРУКТУРЫ ---
+
+// --- НОВАЯ ФУНКЦИЯ ЗАПИСИ ДЛЯ PNG В ПАМЯТЬ ---
+void png_mem_write_data(png_structp png_ptr, png_bytep data, png_size_t length) {
+    struct mem_write_struct *dst = (struct mem_write_struct *)png_get_io_ptr(png_ptr);
+    if (dst->size + length > dst->alloc_size) {
+        size_t new_size = (dst->alloc_size == 0) ? 8192 : dst->alloc_size * 2;
+        while (new_size < dst->size + length) new_size *= 2;
+        unsigned char *tmp = realloc(dst->data, new_size);
+        if (!tmp) {
+            png_error(png_ptr, "Write Error: Realloc failed");
+            return;
+        }
+        dst->data = tmp;
+        dst->alloc_size = new_size;
+    }
+    memcpy(dst->data + dst->size, data, length);
+    dst->size += length;
+}
+
+void png_mem_flush_data(png_structp png_ptr) {
+    // No-op for memory buffer
+}
+// --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+// --- НОВАЯ ФУНКЦИЯ: КОДИРОВАНИЕ PNG В ПАМЯТЬ ---
+int encode_png_to_memory(RGBAImage *in_img, unsigned char **out_data, size_t *out_len) {
+    if (!in_img || !in_img->pixels || in_img->w <= 0 || in_img->h <= 0) {
+        fprintf(stderr, "Encode PNG: Invalid input image\n");
+        return 0;
+    }
+
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) {
+        fprintf(stderr, "PNG: Could not init png write struct\n");
+        return 0;
+    }
+
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) {
+        fprintf(stderr, "PNG: Could not init png info struct\n");
+        png_destroy_write_struct(&png_ptr, NULL);
+        return 0;
+    }
+
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        fprintf(stderr, "PNG: Error during write\n");
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+        if (*out_data) { free(*out_data); *out_data = NULL; }
+        return 0;
+    }
+
+    // Используем пользовательскую функцию записи в память
+    struct mem_write_struct mem_dst = {NULL, 0, 0};
+
+    png_set_write_fn(png_ptr, &mem_dst, png_mem_write_data, png_mem_flush_data);
+
+    png_set_IHDR(png_ptr, info_ptr, in_img->w, in_img->h, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+
+    png_write_info(png_ptr, info_ptr);
+
+    // Write rows
+    png_bytep *row_pointers = (png_bytep*)malloc(in_img->h * sizeof(png_bytep));
+    if (!row_pointers) {
+         fprintf(stderr, "PNG: Could not allocate row pointers memory for encoding\n");
+         png_destroy_write_struct(&png_ptr, &info_ptr);
+         return 0;
+    }
+    for (int y = 0; y < in_img->h; y++) {
+        row_pointers[y] = (png_bytep)(in_img->pixels + y * in_img->w);
+    }
+    png_write_image(png_ptr, row_pointers);
+    free(row_pointers);
+
+    png_write_end(png_ptr, info_ptr);
+
+    *out_data = mem_dst.data;
+    *out_len = mem_dst.size;
+
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    return 1;
+}
+// --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+
+// --- НОВАЯ ФУНКЦИЯ: ОБРЕЗКА ПО ХРОМАКЕЮ С ДОПУСКОМ ---
+RGBAImage* chroma_key_crop_image(RGBAImage *src_img, int x, int y, float tolerance_percent) {
+    if (!src_img || !src_img->pixels || x < 0 || x >= src_img->w || y < 0 || y >= src_img->h) {
+        fprintf(stderr, "Chroma Key Crop: Invalid input or coordinates\n");
+        return NULL;
+    }
+    if (tolerance_percent < 0.0f || tolerance_percent > 100.0f) {
+        fprintf(stderr, "Chroma Key Crop: Tolerance must be between 0.0 and 100.0\n");
+        return NULL;
+    }
+
+    uint32_t chroma_color = src_img->pixels[y * src_img->w + x];
+    uint32_t R_mask = 0x000000FF;
+    uint32_t G_mask = 0x0000FF00;
+    uint32_t B_mask = 0x00FF0000;
+    uint32_t A_mask = 0xFF000000; // Альфа-канал
+
+    uint8_t cr = (chroma_color & R_mask);
+    uint8_t cg = (chroma_color & G_mask) >> 8;
+    uint8_t cb = (chroma_color & B_mask) >> 16;
+
+    // Вычисляем максимальную допустимую разницу для каждой компоненты
+    uint8_t max_diff = (uint8_t)((tolerance_percent / 100.0) * 255.0);
+
+    // Проход 1: Найти границы и отметить пиксели хромакея как прозрачные
+    int min_x = src_img->w, max_x = -1;
+    int min_y = src_img->h, max_y = -1;
+
+    for (int py = 0; py < src_img->h; py++) {
+        for (int px = 0; px < src_img->w; px++) {
+            int idx = py * src_img->w + px;
+            uint32_t pixel = src_img->pixels[idx];
+            uint8_t pr = (pixel & R_mask);
+            uint8_t pg = (pixel & G_mask) >> 8;
+            uint8_t pb = (pixel & B_mask) >> 16;
+            // uint8_t pa = (pixel & A_mask) >> 24; // Получаем текущий альфа-канал (не используется напрямую)
+
+            // Проверяем, находится ли пиксель в пределах допуска от цвета хромакея
+            if (abs(pr - cr) <= max_diff && abs(pg - cg) <= max_diff && abs(pb - cb) <= max_diff) {
+                // Это пиксель хромакея - делаем его прозрачным (альфа = 0)
+                src_img->pixels[idx] &= 0x00FFFFFF; // Оставляем только RGB, устанавливаем альфа = 0
+            } else {
+                // Это не пиксель хромакея - он видимый
+                if (px < min_x) min_x = px;
+                if (px > max_x) max_x = px;
+                if (py < min_y) min_y = py;
+                if (py > max_y) max_y = py;
+            }
+        }
+    }
+
+    if (min_x > max_x || min_y > max_y) {
+        // Изображение состоит только из цвета хромакея или пустое
+        fprintf(stderr, "Chroma Key Crop: No non-chroma pixels found. Creating 1x1 transparent image.\n");
+        RGBAImage *cropped = (RGBAImage*)malloc(sizeof(RGBAImage));
+        if (!cropped) return NULL;
+        cropped->w = 1; cropped->h = 1;
+        cropped->pixels = (uint32_t*)malloc(sizeof(uint32_t));
+        if (!cropped->pixels) { free(cropped); return NULL; }
+        cropped->pixels[0] = 0x00000000; // Полностью прозрачный пиксель
+        return cropped;
+    }
+
+    int new_w = max_x - min_x + 1;
+    int new_h = max_y - min_y + 1;
+
+    RGBAImage *cropped = (RGBAImage*)malloc(sizeof(RGBAImage));
+    if (!cropped) return NULL;
+    cropped->w = new_w;
+    cropped->h = new_h;
+    cropped->pixels = (uint32_t*)malloc(new_w * new_h * sizeof(uint32_t));
+    if (!cropped->pixels) { free(cropped); return NULL; }
+
+    // Проход 2: Скопировать область из исходного изображения
+    for (int cy = 0; cy < new_h; cy++) {
+        for (int cx = 0; cx < new_w; cx++) {
+            int sy = min_y + cy;
+            int sx = min_x + cx;
+            int src_idx = sy * src_img->w + sx;
+            cropped->pixels[cy * new_w + cx] = src_img->pixels[src_idx];
+        }
+    }
+
+    return cropped;
+}
+// --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+
+// --- НОВАЯ ФУНКЦИЯ: МАСШТАБИРОВАНИЕ ИЗОБРАЖЕНИЯ ---
+RGBAImage* scale_image(RGBAImage *src_img, int new_width, int new_height) {
+    if (!src_img || !src_img->pixels || new_width <= 0 || new_height <= 0) {
+        fprintf(stderr, "Scale Image: Invalid input or target dimensions\n");
+        return NULL;
+    }
+
+    RGBAImage *scaled = (RGBAImage*)malloc(sizeof(RGBAImage));
+    if (!scaled) return NULL;
+    scaled->w = new_width;
+    scaled->h = new_height;
+    scaled->pixels = (uint32_t*)malloc(new_width * new_height * sizeof(uint32_t));
+    if (!scaled->pixels) { free(scaled); return NULL; }
+
+    double x_ratio = (double)src_img->w / new_width;
+    double y_ratio = (double)src_img->h / new_height;
+
+    for (int dy = 0; dy < new_height; dy++) {
+        for (int dx = 0; dx < new_width; dx++) {
+            int sx = (int)(dx * x_ratio);
+            int sy = (int)(dy * y_ratio);
+            // Clamp to avoid out-of-bounds access if rounding causes issues
+            if (sx >= src_img->w) sx = src_img->w - 1;
+            if (sy >= src_img->h) sy = src_img->h - 1;
+            scaled->pixels[dy * new_width + dx] = src_img->pixels[sy * src_img->w + sx];
+        }
+    }
+
+    return scaled;
+}
+// --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+
 /* ---------------- Generation functions (используют f-строки) ---------------- */
 void gen_text_var(Var *out, const char *prompt, int max_length) {
     if (!out || !prompt) {
@@ -346,10 +716,12 @@ void gen_text_var(Var *out, const char *prompt, int max_length) {
         "\"use_default_badwordsids\": false"
         "}",
         esc_prompt, max_length);
+
     write_utf8_file("req.json", json_req);
     char resp[262144];
     snprintf(resp, sizeof(resp), "curl -s -X POST %s/api/v1/generate -H \"Content-Type: application/json\" --data-binary @req.json", api_server);
     exec_cmd_capture(resp, resp, sizeof(resp));
+
     // Extract results text
     extern char *extract_results_text(const char *json); // forward
     char *txt = extract_results_text(resp);
@@ -364,6 +736,7 @@ void gen_text_var(Var *out, const char *prompt, int max_length) {
     out->sv[sizeof(out->sv)-1] = 0;
     free(txt);
 }
+
 void gen_img_var(Var *out, const char *prompt, int width, int height) {
     if (!out || !prompt) {
         if (out) {
@@ -373,6 +746,7 @@ void gen_img_var(Var *out, const char *prompt, int width, int height) {
             out->img.h = height;
             out->img.saved = 0;
             out->img.path[0] = 0;
+            out->img.internal_img = NULL; // Инициализация
         }
         return;
     }
@@ -393,10 +767,12 @@ void gen_img_var(Var *out, const char *prompt, int width, int height) {
         "\"seed\": -1"
         "}",
         escaped_prompt, width, height);
+
     write_utf8_file("img.json", json_req);
     char resp[1048576];
     snprintf(resp, sizeof(resp), "curl -s -X POST %s/sdapi/v1/txt2img -H \"Content-Type: application/json\" --data-binary @img.json", api_server);
     exec_cmd_capture(resp, resp, sizeof(resp));
+
     extern char *extract_first_image_b64(const char *json); // forward
     char *b64 = extract_first_image_b64(resp);
     out->type = VAR_IMAGE;
@@ -406,10 +782,12 @@ void gen_img_var(Var *out, const char *prompt, int width, int height) {
     out->img.h = height;
     out->img.saved = 0;
     out->img.path[0] = 0;
+    out->img.internal_img = NULL; // Инициализация
     if (!b64) {
         fprintf(stderr, "Image generation failed. Response: %s\n", resp);
     }
 }
+
 /* ---------------- Save functions ---------------- */
 // --- Вспомогательная функция для декодирования Base64 ---
 static int base64_decode(const char* input, unsigned char** output, size_t* output_len) {
@@ -428,7 +806,6 @@ static int base64_decode(const char* input, unsigned char** output, size_t* outp
         fprintf(stderr, "base64_decode: Memory allocation failed for cleaning input.\n");
         return 0;
     }
-    
     size_t clean_len = 0;
     for (size_t i = 0; i < len; i++) {
         if (!isspace((unsigned char)input[i])) {
@@ -436,7 +813,7 @@ static int base64_decode(const char* input, unsigned char** output, size_t* outp
         }
     }
     clean_input[clean_len] = 0;
-    
+
     // Проверяем, что длина кратна 4, добавляя padding при необходимости
     size_t padding_needed = (4 - (clean_len % 4)) % 4;
     char *padded_input = (char*)malloc(clean_len + padding_needed + 1);
@@ -445,16 +822,14 @@ static int base64_decode(const char* input, unsigned char** output, size_t* outp
         fprintf(stderr, "base64_decode: Memory allocation failed for padded input.\n");
         return 0;
     }
-    
     strncpy(padded_input, clean_input, clean_len);
     for (size_t i = 0; i < padding_needed; i++) {
         padded_input[clean_len + i] = '=';
     }
     padded_input[clean_len + padding_needed] = 0;
-    
     free(clean_input);
     clean_len += padding_needed;
-    
+
     // Check for invalid characters
     static const char* valid_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
     for (size_t i = 0; i < clean_len; i++) {
@@ -464,26 +839,25 @@ static int base64_decode(const char* input, unsigned char** output, size_t* outp
             return 0;
         }
     }
-    
+
     size_t expected_len = clean_len * 3 / 4;
     if (clean_len > 0 && padded_input[clean_len - 1] == '=') expected_len--;
     if (clean_len > 1 && padded_input[clean_len - 2] == '=') expected_len--;
-    
+
     *output = (unsigned char*)malloc(expected_len + 1); // +1 for null terminator
     if (!*output) {
         free(padded_input);
         fprintf(stderr, "base64_decode: Memory allocation failed for output buffer.\n");
         return 0;
     }
-    
+
     static const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t in_idx = 0, out_idx = 0;
     int buffer = 0, bits = 0;
-    
+
     while (in_idx < clean_len) {
         char c = padded_input[in_idx++];
         if (c == '=') break; // Конец данных
-        
         const char *pos = strchr(table, c);
         if (!pos) {
             fprintf(stderr, "base64_decode: Character '%c' not found in table at position %zu.\n", c, in_idx - 1);
@@ -492,20 +866,17 @@ static int base64_decode(const char* input, unsigned char** output, size_t* outp
             *output = NULL;
             return 0;
         }
-        
         int val = (int)(pos - table);
         buffer = (buffer << 6) | val;
         bits += 6;
-        
         if (bits >= 8) {
             bits -= 8;
             (*output)[out_idx++] = (buffer >> bits) & 0xFF;
         }
     }
-    
+
     (*output)[out_idx] = 0; // Null terminator for safety
     *output_len = out_idx;
-    
     free(padded_input);
     return 1; // Успех
 }
@@ -513,57 +884,53 @@ static int base64_decode(const char* input, unsigned char** output, size_t* outp
 // --- Исправленная функция извлечения Base64 изображения из JSON ---
 char *extract_first_image_b64(const char *json) {
     if (!json) return NULL;
-    
     // Находим начало массива изображений
     char *images = strstr((char*)json, "\"images\":");
     if (!images) {
         fprintf(stderr, "Could not find \"images\" field in JSON response.\n");
         return NULL;
     }
-    
+
     char *start_bracket = strchr(images, '[');
     if (!start_bracket) {
         fprintf(stderr, "Could not find opening bracket for images array.\n");
         return NULL;
     }
-    
+
     char *first_quote = strchr(start_bracket, '"');
     if (!first_quote) {
         fprintf(stderr, "Could not find opening quote for base64 string.\n");
         return NULL;
     }
-    
     first_quote++; // Пропускаем начальную кавычку
-    
+
     // Находим конец строки Base64 (следующую незэкранированную кавычку)
     const char *end_quote = first_quote;
     while (*end_quote) {
-        if (*end_quote == '"' && (end_quote == first_quote || *(end_quote - 1) != '\\')) 
+        if (*end_quote == '"' && (end_quote == first_quote || *(end_quote - 1) != '\\'))
             break;
         end_quote++;
     }
-    
     if (*end_quote != '"') {
         fprintf(stderr, "Could not find closing quote for base64 string.\n");
         return NULL;
     }
-    
+
     // Вычисляем длину и копируем данные
     size_t length = end_quote - first_quote;
     if (length == 0) {
         fprintf(stderr, "Empty base64 string found.\n");
         return NULL;
     }
-    
+
     char *raw_b64 = (char*)malloc(length + 1);
     if (!raw_b64) {
         fprintf(stderr, "Memory allocation failed for raw base64 string.\n");
         return NULL;
     }
-    
     strncpy(raw_b64, first_quote, length);
     raw_b64[length] = 0;
-    
+
     // Создаем буфер для очищенной строки
     size_t clean_size = length + 1; // +1 for null terminator
     char *clean = (char*)malloc(clean_size);
@@ -572,7 +939,7 @@ char *extract_first_image_b64(const char *json) {
         fprintf(stderr, "Memory allocation failed for cleaned base64 string.\n");
         return NULL;
     }
-    
+
     // Удаляем все escape-последовательности JSON и пробелы
     size_t j = 0;
     for (size_t i = 0; i < length; i++) {
@@ -614,13 +981,11 @@ char *extract_first_image_b64(const char *json) {
         }
     }
     clean[j] = 0;
-    
     free(raw_b64);
-    
+
     // Добавляем padding, если необходимо
     size_t clean_len = strlen(clean);
     size_t padding_needed = (4 - (clean_len % 4)) % 4;
-    
     if (padding_needed > 0) {
         char *padded = (char*)realloc(clean, clean_len + padding_needed + 1);
         if (!padded) {
@@ -629,13 +994,12 @@ char *extract_first_image_b64(const char *json) {
             return NULL;
         }
         clean = padded;
-        
         for (size_t i = 0; i < padding_needed; i++) {
             clean[clean_len + i] = '=';
         }
         clean[clean_len + padding_needed] = 0;
     }
-    
+
     return clean;
 }
 
@@ -645,59 +1009,107 @@ void save_img_var(Var *v, const char *relpath) {
         fprintf(stderr, "save_img: Variable is not an image.\n");
         return;
     }
-    if (!v->img.b64) {
-        fprintf(stderr, "save_img: No base64 data to save for variable '%s'.\n", v->name);
-        return;
+    // Приоритет у internal_img, если он существует
+    RGBAImage *img_to_save = v->img.internal_img;
+    if (!img_to_save) {
+        if (!v->img.b64) {
+            fprintf(stderr, "save_img: No base64 data and no internal image to save for variable '%s'.\n", v->name);
+            return;
+        }
+        // Если есть только base64, декодируем его в временный RGBAImage
+        unsigned char* decoded_data = NULL;
+        size_t decoded_len = 0;
+        if (!base64_decode(v->img.b64, &decoded_data, &decoded_len)) {
+            fprintf(stderr, "save_img: Failed to decode base64 data for '%s'. Check previous error messages.\n", v->name);
+            return;
+        }
+
+        RGBAImage temp_img = {0};
+        if (!decode_png_from_memory(decoded_data, decoded_len, &temp_img)) {
+            fprintf(stderr, "save_img: Failed to decode PNG from base64 data for '%s'.\n", v->name);
+            free(decoded_data);
+            return;
+        }
+        free(decoded_data); // Буфер больше не нужен
+
+        // Теперь кодируем временный RGBAImage обратно в PNG
+        unsigned char* encoded_data = NULL;
+        size_t encoded_len = 0;
+        if (!encode_png_to_memory(&temp_img, &encoded_data, &encoded_len)) {
+             fprintf(stderr, "save_img: Failed to encode PNG data for saving '%s'.\n", v->name);
+             free_rgba_image(&temp_img);
+             return;
+        }
+        free_rgba_image(&temp_img); // Освобождаем временный буфер пикселей
+
+        // Сохраняем закодированные PNG данные в файл
+        char relnorm[MAX_PATH_LEN];
+        normalize_relpath(relnorm, sizeof(relnorm), relpath);
+        char abs[MAX_PATH_LEN];
+        snprintf(abs, sizeof(abs), "%s\\%s", base_dir, relnorm);
+        make_dirs_for_path(abs);
+
+        FILE *f = fopen(abs, "wb");
+        if (!f) {
+            fprintf(stderr, "save_img: Cannot open file for writing '%s'. Error: %s\n", abs, strerror(errno));
+            free(encoded_data);
+            return;
+        }
+        size_t written = fwrite(encoded_data, 1, encoded_len, f);
+        free(encoded_data);
+        if (written != encoded_len) {
+            fprintf(stderr, "save_img: Failed to write complete image data to '%s'. Expected: %zu, Written: %zu. Error: %s\n",
+                abs, encoded_len, written, ferror(f) ? strerror(errno) : "Unknown error");
+            fclose(f);
+            return;
+        }
+        fclose(f);
+
+        // Устанавливаем пути и статус
+        strncpy(v->img.path, relnorm, sizeof(v->img.path)-1);
+        v->img.path[sizeof(v->img.path)-1] = 0;
+        v->img.saved = 1;
+        printf("Successfully saved image to %s\n", abs);
+        return; // Выходим после сохранения из base64
     }
-    
+
+    // Если internal_img существует, кодируем его и сохраняем
+    unsigned char* encoded_data = NULL;
+    size_t encoded_len = 0;
+    if (!encode_png_to_memory(img_to_save, &encoded_data, &encoded_len)) {
+         fprintf(stderr, "save_img: Failed to encode internal PNG data for saving '%s'.\n", v->name);
+         return;
+    }
+
     char relnorm[MAX_PATH_LEN];
     normalize_relpath(relnorm, sizeof(relnorm), relpath);
     char abs[MAX_PATH_LEN];
     snprintf(abs, sizeof(abs), "%s\\%s", base_dir, relnorm);
     make_dirs_for_path(abs);
-    
-    // 1. Декодируем base64 данные напрямую в память
-    unsigned char* decoded_data = NULL;
-    size_t decoded_len = 0;
-    if (!base64_decode(v->img.b64, &decoded_data, &decoded_len)) {
-        fprintf(stderr, "save_img: Failed to decode base64 data for '%s'. Check previous error messages.\n", abs);
-        return;
-    }
-    
-    // Проверяем, что данные похожи на PNG или JPEG (простая проверка)
-    if (decoded_len < 4) {
-        fprintf(stderr, "save_img: Decoded data is too short to be a valid image.\n");
-        free(decoded_data);
-        return;
-    }
-    
-    // 2. Сохраняем декодированные бинарные данные в файл
-    FILE *f = fopen(abs, "wb"); // Открываем в бинарном режиме ("wb")
+
+    FILE *f = fopen(abs, "wb");
     if (!f) {
         fprintf(stderr, "save_img: Cannot open file for writing '%s'. Error: %s\n", abs, strerror(errno));
-        free(decoded_data);
+        free(encoded_data);
         return;
     }
-    
-    size_t written = fwrite(decoded_data, 1, decoded_len, f);
-    if (written != decoded_len) {
+    size_t written = fwrite(encoded_data, 1, encoded_len, f);
+    free(encoded_data);
+    if (written != encoded_len) {
         fprintf(stderr, "save_img: Failed to write complete image data to '%s'. Expected: %zu, Written: %zu. Error: %s\n",
-            abs, decoded_len, written, ferror(f) ? strerror(errno) : "Unknown error");
+            abs, encoded_len, written, ferror(f) ? strerror(errno) : "Unknown error");
         fclose(f);
-        free(decoded_data);
         return;
     }
-    
     fclose(f);
-    free(decoded_data); // Освобождаем буфер декодированных данных
-    
-    // 3. Устанавливаем пути и статус
+
+    // Устанавливаем пути и статус
     strncpy(v->img.path, relnorm, sizeof(v->img.path)-1);
     v->img.path[sizeof(v->img.path)-1] = 0;
     v->img.saved = 1;
-    
-    printf("Successfully saved image to %s\n", abs);
+    printf("Successfully saved processed image to %s\n", abs);
 }
+
 
 void save_txt_var(Var *v, const char *relpath) {
     if (!v || v->type != VAR_STRING) return;
@@ -711,6 +1123,7 @@ void save_txt_var(Var *v, const char *relpath) {
     fwrite(v->sv, 1, strlen(v->sv), f);
     fclose(f);
 }
+
 /* ---------------- Print / Input ---------------- */
 void do_print_arg(const char *arg) {
     if (!arg) return;
@@ -740,6 +1153,7 @@ void do_print_arg(const char *arg) {
         else fputs("<image>", stdout);
     }
 }
+
 /* input(varname) reads one line from stdin (no prompt). Trims CR/LF */
 void do_input_var(const char *name) {
     if (!name) return;
@@ -760,11 +1174,13 @@ void do_input_var(const char *name) {
     }
     v->type = VAR_STRING;
 }
+
 /* ---------------- Arrays and utilities ---------------- */
 void array_push_demo(const char *s) {
     if (demo_array_len >= (int)(sizeof(demo_array)/sizeof(demo_array[0]))) return;
     demo_array[demo_array_len++] = safe_strdup(s ? s : "");
 }
+
 void print_demo_array(void) {
     printf("[");
     for (int i = 0; i < demo_array_len; ++i) {
@@ -773,18 +1189,21 @@ void print_demo_array(void) {
     }
     printf("]\n");
 }
+
 char *to_upper_str(const char *s) {
     if (!s) return NULL;
     char *r = safe_strdup(s);
     for (char *p = r; *p; ++p) *p = (char)toupper((unsigned char)*p);
     return r;
 }
+
 /* ---------------- Embedded C code insertion ---------------- */
 const char *embedded_c_code =
-    "/* Пример вставленного кода на C */\n"
-    "#include <stdio.h>\n"
-    "int add(int a, int b) { return a + b; }\n"
-    "// Конец вставки\n";
+"/* Пример вставленного кода на C */\n"
+"#include <stdio.h>\n"
+"int add(int a, int b) { return a + b; }\n"
+"// Конец вставки\n";
+
 void save_embedded_c_code(const char *relpath) {
     char relnorm[MAX_PATH_LEN];
     normalize_relpath(relnorm, sizeof(relnorm), relpath);
@@ -793,6 +1212,7 @@ void save_embedded_c_code(const char *relpath) {
     make_dirs_for_path(abs);
     write_utf8_file(abs, embedded_c_code);
 }
+
 /* ---------------- JSON extract helpers ---------------- */
 /* Extract JSON string value robustly: find "key" then colon then quoted string, handle escapes.
 Returns heap-allocated unescaped C string (caller must free) or NULL.
@@ -839,6 +1259,7 @@ char *extract_json_string(const char *json, const char *key) {
     free(acc);
     return final;
 }
+
 /* Extract results[0].text (handles {"results":[{"text":"..."}]}) */
 char *extract_results_text(const char *json) {
     if (!json) return NULL;
@@ -854,12 +1275,201 @@ char *extract_results_text(const char *json) {
     return extract_json_string(json, "text");
 }
 
+// --- НОВАЯ ФУНКЦИЯ: ПРОЦЕССИНГ CHROMA_KEY_CROP С ДОПУСКОМ ---
+void process_chroma_key_crop(const char *line) {
+    char varname[128], src_varname[128];
+    int x, y;
+    float tolerance = 0.0f; // По умолчанию 0%
+    // Пытаемся распарсить вызов с тремя или четырьмя аргументами
+    int args_parsed = sscanf(line, "var %127s = chroma_key_crop(%127[^,], %d, %d, %f)", varname, src_varname, &x, &y, &tolerance);
+    if (args_parsed < 4) {
+         // Попробуем парсинг с тремя аргументами (без допуска)
+         args_parsed = sscanf(line, "var %127s = chroma_key_crop(%127[^,], %d, %d)", varname, src_varname, &x, &y);
+         if (args_parsed != 4) {
+              fprintf(stderr, "chroma_key_crop: Invalid syntax. Expected: var name = chroma_key_crop(src_var, x, y) or var name = chroma_key_crop(src_var, x, y, tolerance_percent)\n");
+              return;
+         }
+         // tolerance уже инициализирован 0.0f
+    }
+
+    Var *src_var = get_var(src_varname);
+    if (!src_var || src_var->type != VAR_IMAGE) {
+        fprintf(stderr, "chroma_key_crop: Source variable '%s' is not an image.\n", src_varname);
+        return;
+    }
+
+    Var *dst_var = create_var_if_missing(varname);
+    if (!dst_var) {
+        fprintf(stderr, "chroma_key_crop: Could not create destination variable '%s'.\n", varname);
+        return;
+    }
+
+    // Убедимся, что внутреннее изображение загружено
+    if (!src_var->img.internal_img && src_var->img.b64) {
+        unsigned char* decoded_data = NULL;
+        size_t decoded_len = 0;
+        if (!base64_decode(src_var->img.b64, &decoded_data, &decoded_len)) {
+            fprintf(stderr, "chroma_key_crop: Failed to decode base64 data for source '%s'.\n", src_varname);
+            return;
+        }
+        RGBAImage *temp_img = (RGBAImage*)malloc(sizeof(RGBAImage));
+        if (!temp_img) {
+             fprintf(stderr, "chroma_key_crop: Memory allocation failed for temporary image.\n");
+             free(decoded_data);
+             return;
+        }
+        memset(temp_img, 0, sizeof(RGBAImage)); // Инициализируем поля
+        if (!decode_png_from_memory(decoded_data, decoded_len, temp_img)) {
+            fprintf(stderr, "chroma_key_crop: Failed to decode PNG from base64 data for source '%s'.\n", src_varname);
+            free(decoded_data);
+            free(temp_img);
+            return;
+        }
+        free(decoded_data);
+        src_var->img.internal_img = temp_img;
+    }
+
+    if (!src_var->img.internal_img) {
+        fprintf(stderr, "chroma_key_crop: Source variable '%s' has no internal image data.\n", src_varname);
+        return;
+    }
+
+    // Создаём копию изображения перед обработкой, чтобы не изменять оригинал
+    RGBAImage *src_copy = (RGBAImage*)malloc(sizeof(RGBAImage));
+    if (!src_copy) {
+         fprintf(stderr, "chroma_key_crop: Memory allocation failed for source image copy.\n");
+         return;
+    }
+    src_copy->w = src_var->img.internal_img->w;
+    src_copy->h = src_var->img.internal_img->h;
+    src_copy->pixels = (uint32_t*)malloc(src_copy->w * src_copy->h * sizeof(uint32_t));
+    if (!src_copy->pixels) {
+         fprintf(stderr, "chroma_key_crop: Memory allocation failed for source image pixel copy.\n");
+         free(src_copy);
+         return;
+    }
+    memcpy(src_copy->pixels, src_var->img.internal_img->pixels, src_copy->w * src_copy->h * sizeof(uint32_t));
+
+    RGBAImage *cropped_img = chroma_key_crop_image(src_copy, x, y, tolerance);
+    // Освобождаем копию сразу после обработки
+    free_rgba_image(src_copy);
+    free(src_copy);
+
+    if (!cropped_img) {
+        fprintf(stderr, "chroma_key_crop: Failed to crop image from variable '%s'.\n", src_varname);
+        return;
+    }
+
+    // Очищаем старое внутреннее изображение в dst_var, если есть
+    if (dst_var->img.internal_img) {
+        free_rgba_image(dst_var->img.internal_img);
+        free(dst_var->img.internal_img);
+        dst_var->img.internal_img = NULL;
+    }
+    // Очищаем старые base64 данные, если они есть
+    if (dst_var->img.b64) {
+        free(dst_var->img.b64);
+        dst_var->img.b64 = NULL;
+    }
+
+    dst_var->type = VAR_IMAGE;
+    dst_var->img.internal_img = cropped_img;
+    dst_var->img.w = cropped_img->w;
+    dst_var->img.h = cropped_img->h;
+    dst_var->img.b64 = NULL; // b64 теперь неактуален, используется internal_img
+    dst_var->img.saved = 0;
+    dst_var->img.path[0] = 0;
+
+    printf("Successfully created cropped image variable '%s' (%dx%d) with tolerance %.2f%%\n", varname, cropped_img->w, cropped_img->h, tolerance);
+}
+// --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+// --- НОВАЯ ФУНКЦИЯ: ПРОЦЕССИНГ SCALE_TO ---
+void process_scale_to(const char *line) {
+    char varname[128], src_varname[128];
+    int width, height;
+    if (sscanf(line, "var %127s = scale_to(%127[^,], %d, %d)", varname, src_varname, &width, &height) == 4) {
+        Var *src_var = get_var(src_varname);
+        if (!src_var || src_var->type != VAR_IMAGE) {
+            fprintf(stderr, "scale_to: Source variable '%s' is not an image.\n", src_varname);
+            return;
+        }
+
+        Var *dst_var = create_var_if_missing(varname);
+        if (!dst_var) {
+            fprintf(stderr, "scale_to: Could not create destination variable '%s'.\n", varname);
+            return;
+        }
+
+        // Убедимся, что внутреннее изображение загружено
+        if (!src_var->img.internal_img && src_var->img.b64) {
+            unsigned char* decoded_data = NULL;
+            size_t decoded_len = 0;
+            if (!base64_decode(src_var->img.b64, &decoded_data, &decoded_len)) {
+                fprintf(stderr, "scale_to: Failed to decode base64 data for source '%s'.\n", src_varname);
+                return;
+            }
+            RGBAImage *temp_img = (RGBAImage*)malloc(sizeof(RGBAImage));
+            if (!temp_img) {
+                 fprintf(stderr, "scale_to: Memory allocation failed for temporary image.\n");
+                 free(decoded_data);
+                 return;
+            }
+            memset(temp_img, 0, sizeof(RGBAImage)); // Инициализируем поля
+            if (!decode_png_from_memory(decoded_data, decoded_len, temp_img)) {
+                fprintf(stderr, "scale_to: Failed to decode PNG from base64 data for source '%s'.\n", src_varname);
+                free(decoded_data);
+                free(temp_img);
+                return;
+            }
+            free(decoded_data);
+            src_var->img.internal_img = temp_img;
+        }
+
+        if (!src_var->img.internal_img) {
+            fprintf(stderr, "scale_to: Source variable '%s' has no internal image data.\n", src_varname);
+            return;
+        }
+
+        RGBAImage *scaled_img = scale_image(src_var->img.internal_img, width, height);
+        if (!scaled_img) {
+            fprintf(stderr, "scale_to: Failed to scale image from variable '%s'.\n", src_varname);
+            return;
+        }
+
+        // Очищаем старое внутреннее изображение в dst_var, если есть
+        if (dst_var->img.internal_img) {
+            free_rgba_image(dst_var->img.internal_img);
+            free(dst_var->img.internal_img);
+            dst_var->img.internal_img = NULL;
+        }
+        // Очищаем старые base64 данные, если они есть
+        if (dst_var->img.b64) {
+            free(dst_var->img.b64);
+            dst_var->img.b64 = NULL;
+        }
+
+        dst_var->type = VAR_IMAGE;
+        dst_var->img.internal_img = scaled_img;
+        dst_var->img.w = scaled_img->w;
+        dst_var->img.h = scaled_img->h;
+        dst_var->img.b64 = NULL; // b64 теперь неактуален, используется internal_img
+        dst_var->img.saved = 0;
+        dst_var->img.path[0] = 0;
+
+        printf("Successfully created scaled image variable '%s' (%dx%d)\n", varname, scaled_img->w, scaled_img->h);
+    }
+}
+// --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+
 /* ---------------- Script parsing & execution ----------------
 Добавлены:
 - if <var> == <value> / if <var> > <num> ...  (только для простоты однословных значений)
 - repeat N { ... } .. } блок с поддержкой "break"
 - команды: emit_c("relpath") для записи embedded C-кода
 - set_server("http://localhost:5001") to change API server
+- chroma_key_crop(var, x, y, tolerance) и scale_to(var, width, height)
 */
 void execute_line_command(const char *l);
 void parse_and_run_script(const char *script_path) {
@@ -873,11 +1483,13 @@ void parse_and_run_script(const char *script_path) {
         if (line_count >= MAX_LINES-1) break;
     }
     fclose(f);
+
     // main execution pointer
     int i = 0;
     while (i < line_count) {
         char *l = lines[i];
         if (!l || l[0] == '#') { i++; continue; }
+
         // context = "..."
         if (starts_with(l, "context")) {
             char val[MAX_LINE];
@@ -894,6 +1506,7 @@ void parse_and_run_script(const char *script_path) {
             }
             i++; continue;
         }
+
         // server = "http://localhost:5001"
         if (starts_with(l, "server")) {
             char val[MAX_LINE];
@@ -908,6 +1521,7 @@ void parse_and_run_script(const char *script_path) {
             }
             i++; continue;
         }
+
         // var name = ...
         if (starts_with(l, "var ")) {
             char name[128];
@@ -915,6 +1529,7 @@ void parse_and_run_script(const char *script_path) {
             char *eq = strchr(name, '=');
             if (eq) *eq = 0;
             Var *v = create_var_if_missing(name);
+
             // generate_text
             if (strstr(l, "generate_text(")) {
                 char pmt[128];
@@ -941,6 +1556,7 @@ void parse_and_run_script(const char *script_path) {
                 }
                 i++; continue;
             }
+
             // generate_img
             if (strstr(l, "generate_img(")) {
                 char pmt[128];
@@ -961,10 +1577,25 @@ void parse_and_run_script(const char *script_path) {
                     }
                     gen_img_var(v, prompt_text, w, h);
                 } else {
-                    v->type = VAR_IMAGE; v->img.b64 = NULL; v->img.w = w; v->img.h = h; v->img.saved = 0;
+                    v->type = VAR_IMAGE; v->img.b64 = NULL; v->img.w = w; v->img.h = h; v->img.saved = 0; v->img.internal_img = NULL;
                 }
                 i++; continue;
             }
+
+            // --- ДОБАВЛЕНО: Обработка chroma_key_crop ---
+            if (strstr(l, "chroma_key_crop(")) {
+                process_chroma_key_crop(l);
+                i++; continue;
+            }
+            // --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
+            // --- ДОБАВЛЕНО: Обработка scale_to ---
+            if (strstr(l, "scale_to(")) {
+                process_scale_to(l);
+                i++; continue;
+            }
+            // --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
             // literal string?
             char lit[32768];
             if (sscanf(l, "var %*s = \"%[^\"]\"", lit) == 1) {
@@ -975,6 +1606,7 @@ void parse_and_run_script(const char *script_path) {
                 render_fstring_with_map(lit, keys, vals, 1, v->sv, sizeof(v->sv));
                 i++; continue;
             }
+
             // integer?
             int ival;
             if (sscanf(l, "var %*s = %d", &ival) == 1) {
@@ -982,11 +1614,13 @@ void parse_and_run_script(const char *script_path) {
                 v->iv = ival;
                 i++; continue;
             }
+
             // else leave as empty string
             v->type = VAR_STRING;
             v->sv[0] = 0;
             i++; continue;
         }
+
         // input(name) - also support f-strings in the variable name
         if (starts_with(l, "input(")) {
             char name[256];
@@ -1000,6 +1634,7 @@ void parse_and_run_script(const char *script_path) {
             }
             i++; continue;
         }
+
         // save_img(var, "rel/path")
         if (starts_with(l, "save_img(")) {
             char varname[128], rel[512];
@@ -1017,6 +1652,7 @@ void parse_and_run_script(const char *script_path) {
             }
             i++; continue;
         }
+
         // save_txt(var, "rel/path")
         if (starts_with(l, "save_txt(")) {
             char varname[128], rel[512];
@@ -1034,6 +1670,7 @@ void parse_and_run_script(const char *script_path) {
             }
             i++; continue;
         }
+
         // emit_c("rel/path") -> saves embedded C code
         if (starts_with(l, "emit_c(")) {
             char rel[512];
@@ -1047,6 +1684,7 @@ void parse_and_run_script(const char *script_path) {
             }
             i++; continue;
         }
+
         // print(...)
         if (starts_with(l, "print(")) {
             char arg[4096];
@@ -1076,11 +1714,13 @@ void parse_and_run_script(const char *script_path) {
             }
             i++; continue;
         }
+
         // if condition: supports e.g. if varname == "value"  OR if varname > 10
         if (starts_with(l, "if ")) {
             // parse crude condition
             char varname[128], op[8], rhs[256];
-            if (sscanf(l, "if %127s %7s %255[^\n]", varname, op, rhs) >= 2) {
+            // Fixed sscanf format string: removed newline character and corrected syntax
+            if (sscanf(l, "if %127s %7s %255s", varname, op, rhs) >= 2) {
                 // trim rhs spaces and quotes
                 char *r = rhs;
                 while (*r && isspace((unsigned char)*r)) r++;
@@ -1122,6 +1762,7 @@ void parse_and_run_script(const char *script_path) {
                 i++; continue;
             }
         }
+
         // repeat block: repeat N { ... }
         if (starts_with(l, "repeat ")) {
             int times = 0;
@@ -1164,6 +1805,7 @@ void parse_and_run_script(const char *script_path) {
                 continue;
             }
         }
+
         // single-word commands: e.g. break (ignored outside repeat), emit_array_push("x")
         if (starts_with(l, "array_push_demo(")) {
             char val[512];
@@ -1185,6 +1827,7 @@ void parse_and_run_script(const char *script_path) {
         i++;
     }
 }
+
 /* Helper для выполнения "одной" строки (упрощённо): поддерживает print, var assignments, save_txt и т.д.
 Это позволяет повторно использовать логику в repeat-блоках.
 */
@@ -1237,6 +1880,7 @@ void execute_line_command(const char *l) {
     }
     // fallback: do nothing
 }
+
 /* ---------------- Entry point ---------------- */
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -1248,25 +1892,35 @@ int main(int argc, char **argv) {
         fprintf(stderr, "GetFullPathNameA failed\n");
         return 1;
     }
-    char *p = strrchr(full, '\\');
-    if (!p) p = strrchr(full, '/');
-    if (p) { *p = 0; strncpy(base_dir, full, sizeof(base_dir)-1); base_dir[sizeof(base_dir)-1] = 0; }
-    else {
-        if (!GetCurrentDirectoryA(MAX_PATH_LEN, base_dir)) base_dir[0] = 0;
-    }
+    // Use shlwapi function to remove filename part
+    PathRemoveFileSpecA(full);
+    strncpy(base_dir, full, sizeof(base_dir)-1);
+    base_dir[sizeof(base_dir)-1] = 0;
+
     // small demo: push some demo array items
     array_push_demo("first");
     array_push_demo("second");
+
     // demo of to_upper_str
     char *u = to_upper_str("demo"); if (u) { array_push_demo(u); free(u); }
+
     parse_and_run_script(argv[1]);
+
     // at exit: save embedded code automatically to base_dir\embedded\snippet.c
     save_embedded_c_code("embedded\\snippet.c");
-    // cleanup allocated base64 strings
+
+    // cleanup allocated base64 strings and internal images
     for (int i = 0; i < var_count; ++i) {
-        if (vars[i].type == VAR_IMAGE && vars[i].img.b64) {
-            free(vars[i].img.b64);
-            vars[i].img.b64 = NULL;
+        if (vars[i].type == VAR_IMAGE) {
+            if (vars[i].img.b64) {
+                free(vars[i].img.b64);
+                vars[i].img.b64 = NULL;
+            }
+            if (vars[i].img.internal_img) {
+                free_rgba_image(vars[i].img.internal_img);
+                free(vars[i].img.internal_img);
+                vars[i].img.internal_img = NULL;
+            }
         }
     }
     for (int i = 0; i < line_count; ++i) free(lines[i]);
