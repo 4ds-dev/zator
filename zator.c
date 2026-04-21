@@ -15,6 +15,7 @@
 #include <string.h>
 #include <png.h>
 #include <setjmp.h>
+#include <curl/curl.h>
 
 /* ---------------- Constants ---------------- */
 #define MAX_LINES 8192
@@ -610,94 +611,118 @@ RGBAImage* scale_image(RGBAImage *src_img, int new_width, int new_height) {
     return scaled;
 }
 
+struct MemoryStruct {
+    char *memory;
+    size_t size;
+};
+
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
+    if (!ptr) return 0;
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+    return realsize;
+}
+
+char* perform_http_request(const char *url, const char *method, const char *json_body) {
+    CURL *curl_handle;
+    CURLcode res;
+    struct MemoryStruct chunk;
+    chunk.memory = malloc(1);
+    chunk.size = 0;
+
+    curl_handle = curl_easy_init();
+    if (!curl_handle) return NULL;
+
+    struct curl_slist *headers = NULL;
+    // Добавляем проверку: если есть тело запроса, тогда ставим JSON
+    if (json_body && strlen(json_body) > 0) {
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, json_body);
+    }
+    
+    headers = curl_slist_append(headers, "User-Agent: Zator/1.0");
+
+    curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+    curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method);
+    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+    
+    // Включаем следование редиректам
+    curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+    // Таймаут, чтобы программа не зависала (например, 10 секунд)
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 10L);
+    
+    // Если работаете с HTTPS и есть проблемы с сертификатами (необязательно, но полезно для отладки)
+    curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
+
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+
+    res = curl_easy_perform(curl_handle);
+
+    if (res != CURLE_OK) {
+        fprintf(stderr, "CURL error (%s) on URL %s: %s\n", method, url, curl_easy_strerror(res));
+        free(chunk.memory);
+        chunk.memory = NULL;
+    }
+
+    curl_easy_cleanup(curl_handle);
+    if (headers) curl_slist_free_all(headers);
+    return chunk.memory;
+}
+
 /* ---------------- Generation functions ---------------- */
 void gen_text_var(Var *out, const char *prompt, int max_length) {
-    if (!out || !prompt) {
-        if (out) {
-            out->type = VAR_STRING;
-            out->sv[0] = 0;
-        }
-        return;
-    }
-    char full_context[16384];
-    snprintf(full_context, sizeof(full_context), "%s\n%s", context_str, prompt);
-    char esc_prompt[16384];
+    if (!out || !prompt) return;
+    char full_context[16384], esc_prompt[16384], json_req[24576];
+    snprintf(full_context, sizeof(full_context), "%s %s", context_str, prompt);
     json_escape(full_context, esc_prompt, sizeof(esc_prompt));
-    char json_req[24576];
-    snprintf(json_req, sizeof(json_req),
-        "{ "
-        "\"prompt\": \"%s\", "
-        "\"max_length\": %d, "
-        "\"max_context_length\": 2048, "
-        "\"temperature\": 0.7, "
-        "\"top_p\": 0.9, "
-        "\"top_k\": 100, "
-        "\"rep_pen\": 1.1, "
-        "\"use_default_badwordsids\": false "
-        "}",
-        esc_prompt, max_length);
-    write_utf8_file("req.json", json_req);
-    char resp[262144];
-    snprintf(resp, sizeof(resp), "curl -s -X POST %s/api/v1/generate -H \"Content-Type: application/json\" --data-binary @req.json", api_server);
-    exec_cmd_capture(resp, resp, sizeof(resp));
-    extern char *extract_results_text(const char *json);
-    char *txt = extract_results_text(resp);
-    if (!txt) {
+    snprintf(json_req, sizeof(json_req), "{\"prompt\": \"%s\", \"max_length\": %d}", esc_prompt, max_length);
+
+    char url[512];
+    snprintf(url, sizeof(url), "%s/api/v1/generate", api_server);
+    char *resp = perform_http_request(url, "POST", json_req);
+    if (resp) {
+        extern char *extract_results_text(const char *json);
+        char *txt = extract_results_text(resp);
         out->type = VAR_STRING;
-        strncpy(out->sv, "[Error generating text]", sizeof(out->sv)-1);
-        out->sv[sizeof(out->sv)-1] = 0;
-        return;
+        strncpy(out->sv, txt ? txt : "", sizeof(out->sv)-1);
+        free(txt); free(resp);
     }
-    out->type = VAR_STRING;
-    strncpy(out->sv, txt, sizeof(out->sv)-1);
-    out->sv[sizeof(out->sv)-1] = 0;
-    free(txt);
 }
 
 void gen_img_var(Var *out, const char *prompt, int width, int height) {
-    if (!out || !prompt) {
-        if (out) {
-            out->type = VAR_IMAGE;
-            out->img.b64 = NULL;
-            out->img.w = width;
-            out->img.h = height;
-            out->img.saved = 0;
-            out->img.path[0] = 0;
-            out->img.internal_img = NULL;
-        }
-        return;
+    if (!out || !prompt) return;
+    char esc_prompt[8192], json_req[16384];
+    json_escape(prompt, esc_prompt, sizeof(esc_prompt));
+    snprintf(json_req, sizeof(json_req), "{\"prompt\": \"%s\", \"width\": %d, \"height\": %d}", esc_prompt, width, height);
+
+    char url[512];
+    snprintf(url, sizeof(url), "%s/sdapi/v1/txt2img", api_server);
+    char *resp = perform_http_request(url, "POST", json_req);
+    if (resp) {
+        extern char *extract_first_image_b64(const char *json);
+        char *b64 = extract_first_image_b64(resp);
+        out->type = VAR_IMAGE;
+        if (out->img.b64) free(out->img.b64);
+        out->img.b64 = b64;
+        out->img.w = width; out->img.h = height;
+        free(resp);
     }
-    char escaped_prompt[8192];
-    json_escape(prompt, escaped_prompt, sizeof(escaped_prompt));
-    char json_req[16384];
-    snprintf(json_req, sizeof(json_req),
-        "{ "
-        "\"prompt\": \"%s\", "
-        "\"negative_prompt\": \"ugly, deformed, noisy, blurry, distorted\", "
-        "\"width\": %d, "
-        "\"height\": %d, "
-        "\"sampler_name\": \"Euler a\", "
-        "\"steps\": 20, "
-        "\"cfg_scale\": 7.0, "
-        "\"seed\": -1 "
-        "}",
-        escaped_prompt, width, height);
-    write_utf8_file("img.json", json_req);
-    char resp[1048576];
-    snprintf(resp, sizeof(resp), "curl -s -X POST %s/sdapi/v1/txt2img -H \"Content-Type: application/json\" --data-binary @img.json", api_server);
-    exec_cmd_capture(resp, resp, sizeof(resp));
-    extern char *extract_first_image_b64(const char *json);
-    char *b64 = extract_first_image_b64(resp);
-    out->type = VAR_IMAGE;
-    if (out->img.b64) { free(out->img.b64); out->img.b64 = NULL; }
-    out->img.b64 = b64;
-    out->img.w = width;
-    out->img.h = height;
-    out->img.saved = 0;
-    out->img.path[0] = 0;
-    out->img.internal_img = NULL;
-    if (!b64) {
-        fprintf(stderr, "Image generation failed. Response: %s\n", resp);
+}
+
+void gen_request_var(Var *out, const char *url_full, const char *method, const char *json_body) {
+    if (!out || !url_full || !method) return;
+    char *resp = perform_http_request(url_full, method, json_body);
+    if (resp) {
+        out->type = VAR_STRING;
+        strncpy(out->sv, resp, sizeof(out->sv)-1);
+        out->sv[sizeof(out->sv)-1] = '\0';
+        free(resp);
     }
 }
 
@@ -1102,52 +1127,6 @@ char *extract_results_text(const char *json) {
         }
     }
     return extract_json_string(json, "text");
-}
-
-/* ---------------- REQUEST ---------------- */
-void gen_request_var(Var *out, const char *url, const char *method, const char *body) {
-    if (!out || !url || !method) {
-        if (out) {
-            out->type = VAR_STRING;
-            out->sv[0] = 0;
-        }
-        return;
-    }
-    char curl_cmd[32768];
-    if (strcmp(method, "POST") == 0) {
-        if (body && strlen(body) > 0) {
-            snprintf(curl_cmd, sizeof(curl_cmd),
-                 "curl -s -X POST -H \"Content-Type: application/json\" -d '%s' \"%s\"",
-                body, url);
-        } else {
-            snprintf(curl_cmd, sizeof(curl_cmd),
-                 "curl -s -X POST \"%s\"",
-                url);
-        }
-    } else if (strcmp(method, "PUT") == 0) {
-        if (body && strlen(body) > 0) {
-            snprintf(curl_cmd, sizeof(curl_cmd),
-                 "curl -s -X PUT -H \"Content-Type: application/json\" -d '%s' \"%s\"",
-                body, url);
-        } else {
-            snprintf(curl_cmd, sizeof(curl_cmd),
-                 "curl -s -X PUT \"%s\"",
-                url);
-        }
-    } else if (strcmp(method, "DELETE") == 0) {
-        snprintf(curl_cmd, sizeof(curl_cmd),
-             "curl -s -X DELETE \"%s\"",
-            url);
-    } else {
-        snprintf(curl_cmd, sizeof(curl_cmd),
-             "curl -s -X GET \"%s\"",
-            url);
-    }
-    char resp[65536];
-    exec_cmd_capture(curl_cmd, resp, sizeof(resp));
-    out->type = VAR_STRING;
-    strncpy(out->sv, resp, sizeof(out->sv)-1);
-    out->sv[sizeof(out->sv)-1] = 0;
 }
 
 /* ---------------- EXEC_CMD ---------------- */
@@ -1715,7 +1694,7 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
             
             if (strstr(l, "generate_text(")) {
                 char pmt[128];
-                int tokens = 0;
+                int tokens = 25;
                 if (sscanf(l, "var %*s = generate_text(%127[^,], context, %d)", pmt, &tokens) >= 1) {
                     char *pp = pmt; while (*pp && isspace((unsigned char)*pp)) pp++;
                     char prompt_text[32768] = "";
