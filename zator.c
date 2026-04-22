@@ -17,6 +17,8 @@
 #include <setjmp.h>
 #include <curl/curl.h>
 
+bool debug_mode = false;
+
 /* ---------------- Constants ---------------- */
 #define MAX_LINES 8192
 #define MAX_LINE 4096
@@ -275,33 +277,30 @@ void make_dirs_for_path(const char *fullpath) {
     char tmp[MAX_PATH_LEN];
     strncpy(tmp, fullpath, sizeof(tmp)-1);
     tmp[sizeof(tmp)-1] = 0;
+
     for (char *p = tmp; *p; ++p) if (*p == '\\') *p = '/';
+
     char *p = tmp;
     if (tmp[0] == '/') p++;
+    
     char *next_slash = p;
     while ((next_slash = strchr(next_slash, '/')) != NULL) {
-        *next_slash = 0;
+        *next_slash = 0; 
+        
         if (access(tmp, F_OK) != 0) {
             #ifdef _WIN32
                 if (mkdir(tmp) != 0 && errno != EEXIST) {
             #else
                 if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
             #endif
-            fprintf(stderr, "Failed to create directory %s: %s\n", tmp, strerror(errno));
+                fprintf(stderr, "Failed to create directory %s: %s\n", tmp, strerror(errno));
             }
         }
-        *next_slash = '/';
+        
+        *next_slash = '/'; 
         next_slash++;
     }
-    if (access(tmp, F_OK) != 0) {
-        #ifdef _WIN32
-            if (mkdir(tmp) != 0 && errno != EEXIST) {
-        #else
-            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-        #endif
-        fprintf(stderr, "Failed to create directory %s: %s\n", tmp, strerror(errno));
-        }
-    }
+
 }
 
 void normalize_relpath(char *dst, size_t dstlen, const char *rel) {
@@ -677,6 +676,9 @@ char* perform_http_request(const char *url, const char *method, const char *json
 
 /* ---------------- Generation functions ---------------- */
 void gen_text_var(Var *out, const char *prompt, int max_length) {
+	if (debug_mode) {
+        printf("[DEBUG] Generating text with prompt: '%s', max_length: %d\n", prompt, max_length);
+    }
     if (!out || !prompt) return;
     char full_context[16384], esc_prompt[16384], json_req[24576];
     snprintf(full_context, sizeof(full_context), "%s %s", context_str, prompt);
@@ -696,6 +698,9 @@ void gen_text_var(Var *out, const char *prompt, int max_length) {
 }
 
 void gen_img_var(Var *out, const char *prompt, int width, int height) {
+	if (debug_mode) {
+        printf("[DEBUG] Generating image with prompt: '%s', width: %d, height: %d\n", prompt, width, height);
+    }
     if (!out || !prompt) return;
     char esc_prompt[8192], json_req[16384];
     json_escape(prompt, esc_prompt, sizeof(esc_prompt));
@@ -716,13 +721,19 @@ void gen_img_var(Var *out, const char *prompt, int width, int height) {
 }
 
 void gen_request_var(Var *out, const char *url_full, const char *method, const char *json_body) {
-    if (!out || !url_full || !method) return;
+    if (debug_mode) {
+        printf("[DEBUG] Making %s request to URL: %s with body: '%s' \n", method, url_full, json_body);
+    }
+	if (!out || !url_full || !method) return;
     char *resp = perform_http_request(url_full, method, json_body);
     if (resp) {
         out->type = VAR_STRING;
         strncpy(out->sv, resp, sizeof(out->sv)-1);
         out->sv[sizeof(out->sv)-1] = '\0';
         free(resp);
+    }
+	if (debug_mode && resp) {
+        printf("[DEBUG] Response received (%zu bytes)\n", strlen(resp));
     }
 }
 
@@ -915,102 +926,116 @@ void save_img_var(Var *v, const char *relpath) {
         fprintf(stderr, "save_img: Variable is not an image.\n");
         return;
     }
+
+    if (debug_mode) {
+        printf("[DEBUG] save_img: Starting save for variable '%s' to path '%s'\n", v->name, relpath);
+    }
+
     RGBAImage *img_to_save = v->img.internal_img;
+    unsigned char* encoded_data = NULL;
+    size_t encoded_len = 0;
+    bool needs_free_img = false;
+    RGBAImage temp_img = {0};
+
     if (!img_to_save) {
+        if (debug_mode) printf("[DEBUG] save_img: No internal image, attempting base64 decode.\n");
+        
         if (!v->img.b64) {
-            fprintf(stderr, "save_img: No base64 data and no internal image to save for variable '%s'.\n", v->name);
+            fprintf(stderr, "save_img: No base64 data and no internal image for '%s'.\n", v->name);
             return;
         }
+
         unsigned char *decoded_data = NULL;
         size_t decoded_len = 0;
         if (!base64_decode(v->img.b64, &decoded_data, &decoded_len)) {
-            fprintf(stderr, "save_img: Failed to decode base64 data for '%s'. Check previous error messages.\n", v->name);
             return;
         }
-        RGBAImage temp_img = {0};
+
         if (!decode_png_from_memory(decoded_data, decoded_len, &temp_img)) {
-            fprintf(stderr, "save_img: Failed to decode PNG from base64 data for '%s'.\n", v->name);
+            fprintf(stderr, "save_img: Failed to decode PNG from base64 for '%s'.\n", v->name);
             free(decoded_data);
             return;
         }
         free(decoded_data);
-        unsigned char* encoded_data = NULL;
-        size_t encoded_len = 0;
-        if (!encode_png_to_memory(&temp_img, &encoded_data, &encoded_len)) {
-             fprintf(stderr, "save_img: Failed to encode PNG data for saving '%s'.\n", v->name);
-             free_rgba_image(&temp_img);
-             return;
-        }
-        free_rgba_image(&temp_img);
-        char relnorm[MAX_PATH_LEN];
-        normalize_relpath(relnorm, sizeof(relnorm), relpath);
-        char abs[MAX_PATH_LEN];
-        snprintf(abs, sizeof(abs), "%s/%s", base_dir, relnorm);
-        make_dirs_for_path(abs);
-        FILE *f = fopen(abs, "wb");
-        if (!f) {
-            fprintf(stderr, "save_img: Cannot open file for writing '%s'. Error: %s\n", abs, strerror(errno));
-            free(encoded_data);
-            return;
-        }
-        size_t written = fwrite(encoded_data, 1, encoded_len, f);
-        free(encoded_data);
-        if (written != encoded_len) {
-            fprintf(stderr, "save_img: Failed to write complete image data to '%s'. Expected: %zu, Written: %zu. Error: %s\n",
-                abs, encoded_len, written, ferror(f) ? strerror(errno) : "Unknown error");
-            fclose(f);
-            return;
-        }
-        fclose(f);
-        strncpy(v->img.path, relnorm, sizeof(v->img.path)-1);
-        v->img.path[sizeof(v->img.path)-1] = 0;
-        v->img.saved = 1;
-        printf("Successfully saved image to %s\n", abs);
+        img_to_save = &temp_img;
+        needs_free_img = true;
+    }
+
+    if (!encode_png_to_memory(img_to_save, &encoded_data, &encoded_len)) {
+        fprintf(stderr, "save_img: Failed to encode PNG for '%s'.\n", v->name);
+        if (needs_free_img) free_rgba_image(&temp_img);
         return;
     }
-    unsigned char* encoded_data = NULL;
-    size_t encoded_len = 0;
-    if (!encode_png_to_memory(img_to_save, &encoded_data, &encoded_len)) {
-         fprintf(stderr, "save_img: Failed to encode internal PNG data for saving '%s'.\n", v->name);
-         return;
-    }
+    
+    if (needs_free_img) free_rgba_image(&temp_img);
+
     char relnorm[MAX_PATH_LEN];
     normalize_relpath(relnorm, sizeof(relnorm), relpath);
     char abs[MAX_PATH_LEN];
     snprintf(abs, sizeof(abs), "%s/%s", base_dir, relnorm);
+
+    if (debug_mode) {
+        printf("[DEBUG] save_img: Final absolute path: %s\n", abs);
+        printf("[DEBUG] save_img: Encoded size: %zu bytes\n", encoded_len);
+    }
+
     make_dirs_for_path(abs);
     FILE *f = fopen(abs, "wb");
     if (!f) {
-        fprintf(stderr, "save_img: Cannot open file for writing '%s'. Error: %s\n", abs, strerror(errno));
+        fprintf(stderr, "save_img: Cannot open %s. Error: %s\n", abs, strerror(errno));
         free(encoded_data);
         return;
     }
+
     size_t written = fwrite(encoded_data, 1, encoded_len, f);
+    fclose(f);
     free(encoded_data);
+
     if (written != encoded_len) {
-        fprintf(stderr, "save_img: Failed to write complete image data to '%s'. Expected: %zu, Written: %zu. Error: %s\n",
-            abs, encoded_len, written, ferror(f) ? strerror(errno) : "Unknown error");
-        fclose(f);
+        fprintf(stderr, "save_img: Write mismatch for '%s'. Written %zu/%zu\n", abs, written, encoded_len);
         return;
     }
-    fclose(f);
+
     strncpy(v->img.path, relnorm, sizeof(v->img.path)-1);
     v->img.path[sizeof(v->img.path)-1] = 0;
     v->img.saved = 1;
-    printf("Successfully saved processed image to %s\n", abs);
+
+    if (debug_mode) {
+        printf("[DEBUG] save_img: Successfully saved '%s'\n", v->name);
+    } else {
+        printf("Successfully saved image to %s\n", abs);
+    }
 }
 
 void save_txt_var(Var *v, const char *relpath) {
-    if (!v || v->type != VAR_STRING) return;
+    if (!v || v->type != VAR_STRING) {
+        if (debug_mode) printf("[DEBUG] save_txt: Variable NULL or not a string.\n");
+        return;
+    }
+
     char relnorm[MAX_PATH_LEN];
     normalize_relpath(relnorm, sizeof(relnorm), relpath);
     char abs[MAX_PATH_LEN];
     snprintf(abs, sizeof(abs), "%s/%s", base_dir, relnorm);
+
+    if (debug_mode) {
+        printf("[DEBUG] save_txt: Saving string '%s' to %s\n", v->name, abs);
+    }
+
     make_dirs_for_path(abs);
     FILE *f = fopen(abs, "wb");
-    if (!f) { fprintf(stderr, "save_txt: cannot open %s\n", abs); return; }
-    fwrite(v->sv, 1, strlen(v->sv), f);
+    if (!f) { 
+        fprintf(stderr, "save_txt: cannot open %s\n", abs); 
+        return; 
+    }
+
+    size_t len = strlen(v->sv);
+    size_t written = fwrite(v->sv, 1, len, f);
     fclose(f);
+
+    if (debug_mode) {
+        printf("[DEBUG] save_txt: Written %zu bytes.\n", written);
+    }
 }
 
 /* ---------------- Print / Input ---------------- */
@@ -1671,9 +1696,9 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
         }
         
         // server
-        if (starts_with(l, "server ")) {
+        if (starts_with(l, "@server_url ")) {
             char val[MAX_LINE];
-            if (sscanf(l, "server = \"%[^\"]\"", val) == 1) {
+            if (sscanf(l, "@server_url = \"%[^\"]\"", val) == 1) {
                 const char *keys[] = { "context" };
                 const char *vals[] = { context_str };
                 char rendered_val[256];
@@ -1695,14 +1720,12 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
             if (strstr(l, "generate_text(")) {
                 char pmt[128];
                 int tokens = 25;
-                if (sscanf(l, "var %*s = generate_text(%127[^,], context, %d)", pmt, &tokens) >= 1) {
+                if (sscanf(l, "var %*s = generate_text(%127[^,], %d)", pmt, &tokens) >= 1) {
                     char *pp = pmt; while (*pp && isspace((unsigned char)*pp)) pp++;
                     char prompt_text[32768] = "";
                     if (*pp == '"') {
                         char tmp[32768]; if (sscanf(pp, "\"%[^\"]\"", tmp) == 1) {
-                            const char *keys[] = { "context" };
-                            const char *vals[] = { context_str };
-                            render_fstring_with_map(tmp, keys, vals, 1, prompt_text, sizeof(prompt_text));
+                            strncpy(prompt_text, tmp, sizeof(prompt_text)-1);
                         }
                     } else {
                         Var *vp = get_var(pp);
@@ -1718,14 +1741,12 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
             if (strstr(l, "generate_img(")) {
                 char pmt[128];
                 int w = 512, h = 512;
-                if (sscanf(l, "var %*s = generate_img(%127[^,], context, %d, %d", pmt, &w, &h) >= 1) {
+                if (sscanf(l, "var %*s = generate_img(%127[^,], %d, %d", pmt, &w, &h) >= 1) {
                     char *pp = pmt; while (*pp && isspace((unsigned char)*pp)) pp++;
                     char prompt_text[32768] = "";
                     if (*pp == '"') {
                         char tmp[32768]; if (sscanf(pp, "\"%[^\"]\"", tmp) == 1) {
-                            const char *keys[] = { "context" };
-                            const char *vals[] = { context_str };
-                            render_fstring_with_map(tmp, keys, vals, 1, prompt_text, sizeof(prompt_text));
+                            strncpy(prompt_text, tmp, sizeof(prompt_text)-1);
                         }
                     } else {
                         Var *vp = get_var(pp);
@@ -1739,25 +1760,22 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
             }
             
             if (strstr(l, "request(")) {
-                char url[128], method[16], result_var_name[128], body[32768];
-                int arg_count = sscanf(l, "var %127s = request(\"%127[^\"]\", \"%15[^\"]\", \"%32767[^\"]\")", result_var_name, url, method, body);
-                if (arg_count == 4) {
-                    Var *result_var = create_var_if_missing(result_var_name);
-                    if (result_var) {
-                        gen_request_var(result_var, url, method, body);
-                    } else {
-                        fprintf(stderr, "request: Could not create result variable '%s'.\n", result_var_name);
-                    }
-                } else if ((arg_count = sscanf(l, "var %127s = request(\"%127[^\"]\", \"%15[^\"]\")", result_var_name, url, method)) == 3) {
-                    Var *result_var = create_var_if_missing(result_var_name);
-                    if (result_var) {
-                        gen_request_var(result_var, url, method, NULL);
-                    } else {
-                        fprintf(stderr, "request: Could not create result variable '%s'.\n", result_var_name);
-                    }
-                } else {
+                char url[128], method[16], body[32768];
+                
+                int arg_count = sscanf(l, "var %*s = request(\"%127[^\"]\", \"%15[^\"]\", \"%32767[^\"]\")", url, method, body);
+                
+                if (arg_count == 3) {
+                    gen_request_var(v, url, method, body);
+                } 
+                else if (sscanf(l, "var %*s = request(\"%127[^\"]\", \"%15[^\"]\")", url, method) == 2) {
+                    gen_request_var(v, url, method, NULL);
+                } 
+                else {
                     fprintf(stderr, "request: Invalid syntax.\n");
+                    v->type = VAR_STRING; 
+                    v->sv[0] = 0;
                 }
+                
                 i++; continue;
             }
             
@@ -2080,13 +2098,32 @@ void execute_line_command(const char *l) {
 }
 
 /* ---------------- Entry point ---------------- */
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s script.zator\n", argv[0]);
+int main(int argc, char **argv) {if (argc < 2) {
+        fprintf(stderr, "Usage: %s <script.zator> [--debug]\n", argv[0]);
         return 1;
     }
+
+    char *script_file = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0) {
+            debug_mode = true;
+        } else {
+            script_file = argv[i];
+        }
+    }
+
+    if (!script_file) {
+        fprintf(stderr, "Error: No script file provided.\n");
+        return 1;
+    }
+
+    if (debug_mode) {
+        printf("[DEBUG] Running in debug mode\n");
+    }
+
     char temp_path[MAX_PATH_LEN];
-    strncpy(temp_path, argv[1], sizeof(temp_path) - 1);
+    strncpy(temp_path, script_file, sizeof(temp_path) - 1);
     temp_path[sizeof(temp_path) - 1] = '\0';
     char *script_dir = dirname(temp_path);
     strncpy(base_dir, script_dir, sizeof(base_dir) - 1);
