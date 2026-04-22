@@ -627,18 +627,22 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
     return realsize;
 }
 
-char* perform_http_request(const char *url, const char *method, const char *json_body) {
+char* perform_http_request(const char *url, const char *method, const char *json_body, long timeout_sec) {
     CURL *curl_handle;
     CURLcode res;
     struct MemoryStruct chunk;
+    
     chunk.memory = malloc(1);
+    if (!chunk.memory) return NULL; 
     chunk.size = 0;
 
     curl_handle = curl_easy_init();
-    if (!curl_handle) return NULL;
+    if (!curl_handle) {
+        free(chunk.memory);
+        return NULL;
+    }
 
     struct curl_slist *headers = NULL;
-    // Добавляем проверку: если есть тело запроса, тогда ставим JSON
     if (json_body && strlen(json_body) > 0) {
         headers = curl_slist_append(headers, "Content-Type: application/json");
         curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, json_body);
@@ -650,12 +654,12 @@ char* perform_http_request(const char *url, const char *method, const char *json
     curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method);
     curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
     
-    // Включаем следование редиректам
     curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
-    // Таймаут, чтобы программа не зависала (например, 10 секунд)
-    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 10L);
     
-    // Если работаете с HTTPS и есть проблемы с сертификатами (необязательно, но полезно для отладки)
+    long final_timeout = (timeout_sec > 0) ? timeout_sec : 10L;
+    
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, final_timeout);  
+    curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, (final_timeout < 5) ? final_timeout : 5L);   
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
 
     curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
@@ -671,6 +675,7 @@ char* perform_http_request(const char *url, const char *method, const char *json
 
     curl_easy_cleanup(curl_handle);
     if (headers) curl_slist_free_all(headers);
+    
     return chunk.memory;
 }
 
@@ -687,7 +692,7 @@ void gen_text_var(Var *out, const char *prompt, int max_length) {
 
     char url[512];
     snprintf(url, sizeof(url), "%s/api/v1/generate", api_server);
-    char *resp = perform_http_request(url, "POST", json_req);
+    char *resp = perform_http_request(url, "POST", json_req, max_length*10L);
     if (resp) {
         extern char *extract_results_text(const char *json);
         char *txt = extract_results_text(resp);
@@ -708,7 +713,7 @@ void gen_img_var(Var *out, const char *prompt, int width, int height) {
 
     char url[512];
     snprintf(url, sizeof(url), "%s/sdapi/v1/txt2img", api_server);
-    char *resp = perform_http_request(url, "POST", json_req);
+    char *resp = perform_http_request(url, "POST", json_req, 0);
     if (resp) {
         extern char *extract_first_image_b64(const char *json);
         char *b64 = extract_first_image_b64(resp);
@@ -725,7 +730,7 @@ void gen_request_var(Var *out, const char *url_full, const char *method, const c
         printf("[DEBUG] Making %s request to URL: %s with body: '%s' \n", method, url_full, json_body);
     }
 	if (!out || !url_full || !method) return;
-    char *resp = perform_http_request(url_full, method, json_body);
+    char *resp = perform_http_request(url_full, method, json_body, 0);
     if (resp) {
         out->type = VAR_STRING;
         strncpy(out->sv, resp, sizeof(out->sv)-1);
