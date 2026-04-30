@@ -183,14 +183,22 @@ void unescape_inplace(const char *src, char *dst, size_t dstlen) {
     while (*src && left > 0) {
         if (*src == '\\') {
             src++;
-            if (*src == 'n') { *d++ = '\n'; src++; left--; }
-            else if (*src == 't') { *d++ = '\t'; src++; left--; }
-            else if (*src == 'r') { *d++ = '\r'; src++; left--; }
-            else if (*src == '"') { *d++ = '"'; src++; left--; }
-            else if (*src == '\\') { *d++ = '\\'; src++; left--; }
-            else { *d++ = *src++; left--; }
+            if (!*src) break;
+            switch (*src) {
+                case 'n':  *d++ = '\n'; break;
+                case 't':  *d++ = '\t'; break;
+                case 'r':  *d++ = '\r'; break;
+                case '"':  *d++ = '"';  break;
+                case '\\': *d++ = '\\'; break;
+                case '{':  *d++ = '{';  break;
+                case '}':  *d++ = '}';  break;
+                default:   *d++ = *src; break;
+            }
+            src++;
+            left--;
         } else {
-            *d++ = *src++; left--;
+            *d++ = *src++;
+            left--;
         }
     }
     *d = 0;
@@ -219,56 +227,102 @@ const char *var_to_string(const Var *v, char *buf, size_t buflen) {
     return buf;
 }
 
-void render_fstring_with_map(const char *fmt, const char **keys, const char **values, int nkeys, char *out, size_t outlen) {
-    if (!fmt || !out || outlen == 0) return;
-    char *d = out;
-    size_t left = outlen - 1;
-    const char *p = fmt;
-    while (*p && left > 0) {
-        if (*p == '\\') {
-            if (*(p+1) == '{') { if (left > 0) { *d++ = '{'; left--; } p += 2; continue; }
-            if (*(p+1) == '}') { if (left > 0) { *d++ = '}'; left--; } p += 2; continue; }
-            if (*(p+1) == '\\') { if (left > 0) { *d++ = '\\'; left--; } p += 2; continue; }
-            if (left > 0) { *d++ = *p++; left--; }
-        } else if (*p == '{') {
-            const char *q = p + 1;
-            const char *start = q;
-            while (*q && *q != '}') q++;
-            if (*q != '}') {
-                if (left > 0) { *d++ = *p; left--; p++; }
-            } else {
-                size_t keylen = (size_t)(q - start);
-                char key[512]; if (keylen >= sizeof(key)) keylen = sizeof(key)-1;
-                memcpy(key, start, keylen); key[keylen] = 0;
-                char *kstart = key;
-                while (*kstart && isspace((unsigned char)*kstart)) kstart++;
-                char *kend = key + strlen(key) - 1;
-                while (kend > kstart && isspace((unsigned char)*kend)) { *kend = 0; kend--; }
-                const char *replacement = NULL;
-                for (int i = 0; i < nkeys; ++i) {
-                    if (keys[i] && strcmp(keys[i], kstart) == 0) { replacement = values[i]; break; }
-                }
-                char tmpbuf[65536];
-                if (!replacement) {
-                    Var *v = get_var(kstart);
-                    if (v) replacement = var_to_string(v, tmpbuf, sizeof(tmpbuf));
-                }
-                if (!replacement) replacement = "";
-                size_t rlen = strlen(replacement);
-                size_t tocopy = (rlen < left) ? rlen : left;
-                if (tocopy > 0) {
-                    memcpy(d, replacement, tocopy);
-                    d += tocopy;
-                    left -= tocopy;
-                }
-                p = q + 1;
+void unescape_string(const char *in, char *out, size_t maxlen) {
+    size_t i = 0;
+
+    for (size_t j = 0; in[j] && i + 1 < maxlen; j++) {
+        if (in[j] == '\\') {
+            j++;
+            if (!in[j]) break;
+
+            switch (in[j]) {
+                case 'n': out[i++] = '\n'; break;
+                case 't': out[i++] = '\t'; break;
+                case '\\': out[i++] = '\\'; break;
+                case '"': out[i++] = '"'; break;
+                case '{': out[i++] = '\x01'; break;
+                case '}': out[i++] = '\x02'; break;
+                default:
+                    out[i++] = in[j];
+                    break;
             }
         } else {
-            *d++ = *p++;
-            left--;
+            out[i++] = in[j];
         }
     }
-    *d = 0;
+
+    out[i] = 0;
+}
+
+void render_fstring(const char *fmt, char *out, size_t outlen) {
+    size_t oi = 0;
+    size_t i = 0;
+
+    while (fmt[i] && oi + 1 < outlen) {
+        if (fmt[i] == '\x01') {
+            out[oi++] = '{';
+            i++;
+            continue;
+        }
+        if (fmt[i] == '\x02') {
+            out[oi++] = '}';
+            i++;
+            continue;
+        }
+
+        if (fmt[i] == '{') {
+            size_t j = i + 1;
+            char key[128];
+            int ki = 0;
+
+            while (fmt[j] && fmt[j] != '}' && ki < 127) {
+                key[ki++] = fmt[j++];
+            }
+
+            if (fmt[j] == '}') {
+                key[ki] = 0;
+
+                char *kstart = key;
+                while (*kstart && isspace((unsigned char)*kstart)) kstart++;
+                char *kend = kstart + strlen(kstart) - 1;
+                while (kend > kstart && isspace((unsigned char)*kend)) { *kend = 0; kend--; }
+
+                Var *v = get_var(kstart);
+                if (v) {
+                    char valbuf[32768];
+                    const char *val = var_to_string(v, valbuf, sizeof(valbuf));
+                    for (size_t k = 0; val[k] && oi + 1 < outlen; k++) {
+                        out[oi++] = val[k];
+                    }
+                }
+                i = j + 1;
+            } else {
+                out[oi++] = fmt[i];
+                i++;
+            }
+        } else {
+            out[oi++] = fmt[i];
+            i++;
+        }
+    }
+
+    out[oi] = 0;
+}
+
+void process_string(char *in, char *out, size_t outlen) {
+    char tmp[8192];
+
+    unescape_string(in, tmp, sizeof(tmp));
+    render_fstring(tmp, out, outlen);
+}
+
+void strip_quotes(char *s) {
+    size_t len = strlen(s);
+
+    if (len >= 2 && s[0] == '"' && s[len - 1] == '"') {
+        memmove(s, s + 1, len - 2);
+        s[len - 2] = 0;
+    }
 }
 
 /* ---------------- Files & Directories ---------------- */
@@ -304,17 +358,43 @@ void make_dirs_for_path(const char *fullpath) {
 }
 
 void normalize_relpath(char *dst, size_t dstlen, const char *rel) {
-    if (!dst || !rel) return;
+    if (!dst || !rel || dstlen == 0) return;
+
     size_t j = 0;
     size_t i = 0;
-    if ((rel[0] == '.' && (rel[1] == '/' || rel[1] == '\\')) ) i = 2;
-    while (rel[i] && j + 1 < dstlen) {
+
+    // Пропуск начального "./" или ".\"
+    if (rel[0] == '.' && (rel[1] == '/' || rel[1] == '\\')) {
+        i = 2;
+    }
+
+    while (rel[i] && (j + 1 < dstlen)) {
         char c = rel[i++];
-        if (c == '\\') c = '/';
-        if (j == 0 && (c == '/')) continue;
+
+        // Обработка escape-последовательностей через ':'
+        if (c == ':' && rel[i] != '\0') {
+            char next = rel[i++];
+            switch (next) {
+                case '>':  c = '\\'; break; // \ ->
+                case 'n':  c = '\n'; break; // перенос строки
+                case '"':  c = '\"'; break; // двойная кавычка
+                case '{':  c = '{';  break; // фигурные скобки
+                case '}':  c = '}';  break;
+                case ':':  c = ':';  break; // сам двоеточие (::)
+                default:   c = next; break; // если символ неизвестен, берем как есть
+            }
+        } else {
+            // Стандартная замена слешей
+            if (c == '\\') c = '/';
+        }
+
+        // Пропуск начальных слешей (как в оригинале)
+        if (j == 0 && c == '/') continue;
+
         dst[j++] = c;
     }
-    dst[j] = 0;
+
+    dst[j] = '\0';
 }
 
 /* ---------------- Exec command ---------------- */
@@ -1093,10 +1173,10 @@ void do_input_var(const char *name) {
 
 /* ---------------- Embedded C code ---------------- */
 const char *embedded_c_code =
-"/* ������ ����������� ���� �� C */\n"
+"/* ������ ����������� ���� �� C */\n"
 "#include <stdio.h>\n"
 "int add(int a, int b) { return a + b; }\n"
-"// ������ �������\n";
+"// ������ �������\n";
 
 void save_embedded_c_code(const char *relpath) {
     char relnorm[MAX_PATH_LEN];
@@ -1174,10 +1254,8 @@ void process_exec_cmd(const char *line) {
             *end = 0;
         }
         
-        const char *keys[] = { "context" };
-        const char *vals[] = { context_str };
         char rendered_cmd[32768];
-        render_fstring_with_map(p, keys, vals, 1, rendered_cmd, sizeof(rendered_cmd));
+        process_string(p, rendered_cmd, sizeof(rendered_cmd));
         
         Var *v = create_var_if_missing(varname);
         if (!v) {
@@ -1210,10 +1288,8 @@ void process_exec_cmd(const char *line) {
         end = vn + strlen(vn) - 1;
         while (end > vn && isspace((unsigned char)*end)) { *end = 0; end--; }
         
-        const char *keys[] = { "context" };
-        const char *vals[] = { context_str };
         char rendered_cmd[32768];
-        render_fstring_with_map(p, keys, vals, 1, rendered_cmd, sizeof(rendered_cmd));
+        process_string(p, rendered_cmd, sizeof(rendered_cmd));
         
         Var *v = create_var_if_missing(vn);
         if (!v) {
@@ -1546,10 +1622,8 @@ void process_func_call(const char *line, int call_index) {
         if (v) {
             v->type = VAR_STRING;
             
-            const char *keys[] = { "context" };
-            const char *vals[] = { context_str };
             char rendered_arg[32768];
-            render_fstring_with_map(arg_values[i], keys, vals, 1, rendered_arg, sizeof(rendered_arg));
+            process_string(arg_values[i], rendered_arg, sizeof(rendered_arg));
             
             strncpy(v->sv, rendered_arg, sizeof(v->sv) - 1);
             v->sv[sizeof(v->sv) - 1] = 0;
@@ -1688,10 +1762,8 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
         if (starts_with(l, "context ")) {
             char val[MAX_LINE];
             if (sscanf(l, "context = \"%[^\"]\"", val) == 1) {
-                const char *keys[] = { "context" };
-                const char *vals[] = { context_str };
                 char rendered_val[8192];
-                render_fstring_with_map(val, keys, vals, 1, rendered_val, sizeof(rendered_val));
+                process_string(val, rendered_val, sizeof(rendered_val));
                 strncpy(context_str, rendered_val, sizeof(context_str)-1);
                 context_str[sizeof(context_str)-1] = 0;
             } else {
@@ -1704,10 +1776,8 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
         if (starts_with(l, "@server_url ")) {
             char val[MAX_LINE];
             if (sscanf(l, "@server_url = \"%[^\"]\"", val) == 1) {
-                const char *keys[] = { "context" };
-                const char *vals[] = { context_str };
                 char rendered_val[256];
-                render_fstring_with_map(val, keys, vals, 1, rendered_val, sizeof(rendered_val));
+                process_string(val, rendered_val, sizeof(rendered_val));
                 strncpy(api_server, rendered_val, sizeof(api_server)-1);
                 api_server[sizeof(api_server)-1] = 0;
             }
@@ -1722,47 +1792,73 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
             if (eq) *eq = 0;
             Var *v = create_var_if_missing(name);
             
-            if (strstr(l, "generate_text(")) {
-                char pmt[128];
-                int tokens = 25;
-                if (sscanf(l, "var %*s = generate_text(%127[^,], %d)", pmt, &tokens) >= 1) {
-                    char *pp = pmt; while (*pp && isspace((unsigned char)*pp)) pp++;
-                    char prompt_text[32768] = "";
-                    if (*pp == '"') {
-                        char tmp[32768]; if (sscanf(pp, "\"%[^\"]\"", tmp) == 1) {
-                            strncpy(prompt_text, tmp, sizeof(prompt_text)-1);
-                        }
-                    } else {
-                        Var *vp = get_var(pp);
-                        if (vp) strncpy(prompt_text, vp->sv, sizeof(prompt_text)-1);
-                    }
-                    gen_text_var(v, prompt_text, tokens);
-                } else {
-                    v->type = VAR_STRING; v->sv[0] = 0;
-                }
-                i++; continue;
-            }
+			if (strstr(l, "generate_text(")) {
+				char prompt_text[32768] = "";
+				int tokens = 25;
+
+				char *args = strchr(l, '(');
+				if (args) {
+					args++; 
+					while (*args && isspace((unsigned char)*args)) args++;
+
+					if (*args == '"') {
+						sscanf(args, "\"%[^\"]\"", prompt_text);
+						
+						char *closing_quote = strchr(args + 1, '"');
+						if (closing_quote) {
+							char *comma = strchr(closing_quote, ',');
+							if (comma) sscanf(comma + 1, "%d", &tokens);
+						}
+					} else {
+						char var_name[128];
+						if (sscanf(args, "%127[^,)]", var_name) == 1) {
+							Var *vp = get_var(var_name);
+							if (vp) strncpy(prompt_text, vp->sv, sizeof(prompt_text)-1);
+						}
+						
+						char *comma = strchr(args, ',');
+						if (comma) sscanf(comma + 1, "%d", &tokens);
+					}
+				}
+				
+				char interpolated_prompt[32768] = "";
+				process_string(prompt_text, interpolated_prompt, sizeof(interpolated_prompt));
+				gen_text_var(v, interpolated_prompt, tokens);
+				i++; continue;
+}
             
-            if (strstr(l, "generate_img(")) {
-                char pmt[128];
-                int w = 512, h = 512;
-                if (sscanf(l, "var %*s = generate_img(%127[^,], %d, %d", pmt, &w, &h) >= 1) {
-                    char *pp = pmt; while (*pp && isspace((unsigned char)*pp)) pp++;
-                    char prompt_text[32768] = "";
-                    if (*pp == '"') {
-                        char tmp[32768]; if (sscanf(pp, "\"%[^\"]\"", tmp) == 1) {
-                            strncpy(prompt_text, tmp, sizeof(prompt_text)-1);
-                        }
-                    } else {
-                        Var *vp = get_var(pp);
-                        if (vp) strncpy(prompt_text, vp->sv, sizeof(prompt_text)-1);
-                    }
-                    gen_img_var(v, prompt_text, w, h);
-                } else {
-                    v->type = VAR_IMAGE; v->img.b64 = NULL; v->img.w = w; v->img.h = h; v->img.saved = 0; v->img.internal_img = NULL;
-                }
-                i++; continue;
-            }
+			if (strstr(l, "generate_img(")) {
+				char prompt_text[32768] = "";
+				int w = 512, h = 512;
+
+				char *args = strchr(l, '(');
+				if (args) {
+					args++;
+					while (*args && isspace((unsigned char)*args)) args++;
+
+					if (*args == '"') {
+						sscanf(args, "\"%[^\"]\"", prompt_text);
+						char *closing_quote = strchr(args + 1, '"');
+						if (closing_quote) {
+							char *comma = strchr(closing_quote, ',');
+							if (comma) sscanf(comma + 1, " %d , %d", &w, &h);
+						}
+					} else {
+						char var_name[128];
+						if (sscanf(args, "%127[^,)]", var_name) == 1) {
+							Var *vp = get_var(var_name);
+							if (vp) strncpy(prompt_text, vp->sv, sizeof(prompt_text)-1);
+						}
+						char *comma = strchr(args, ',');
+						if (comma) sscanf(comma + 1, " %d , %d", &w, &h);
+					}
+				}
+
+				char interpolated_prompt[32768] = "";
+				process_string(prompt_text, interpolated_prompt, sizeof(interpolated_prompt));
+				gen_img_var(v, interpolated_prompt, w, h);
+				i++; continue;
+			}
             
             if (strstr(l, "request(")) {
                 char url[128], method[16], body[32768];
@@ -1770,10 +1866,22 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
                 int arg_count = sscanf(l, "var %*s = request(\"%127[^\"]\", \"%15[^\"]\", \"%32767[^\"]\")", url, method, body);
                 
                 if (arg_count == 3) {
-                    gen_request_var(v, url, method, body);
+                    char interp_url[128], interp_method[16], interp_body[32768];
+                    interp_url[0] = 0;
+                    interp_method[0] = 0;
+                    interp_body[0] = 0;
+                    process_string(url, interp_url, sizeof(interp_url));
+                    process_string(method, interp_method, sizeof(interp_method));
+                    process_string(body, interp_body, sizeof(interp_body));
+                    gen_request_var(v, interp_url, interp_method, interp_body);
                 } 
                 else if (sscanf(l, "var %*s = request(\"%127[^\"]\", \"%15[^\"]\")", url, method) == 2) {
-                    gen_request_var(v, url, method, NULL);
+                    char interp_url[128], interp_method[16];
+                    interp_url[0] = 0;
+                    interp_method[0] = 0;
+                    process_string(url, interp_url, sizeof(interp_url));
+                    process_string(method, interp_method, sizeof(interp_method));
+                    gen_request_var(v, interp_url, interp_method, NULL);
                 } 
                 else {
                     fprintf(stderr, "request: Invalid syntax.\n");
@@ -1802,9 +1910,9 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
             char lit[32768];
             if (sscanf(l, "var %*s = \"%[^\"]\"", lit) == 1) {
                 v->type = VAR_STRING;
-                const char *keys[] = { "context" };
-                const char *vals[] = { context_str };
-                render_fstring_with_map(lit, keys, vals, 1, v->sv, sizeof(v->sv));
+                v->sv[0] = 0;
+                process_string(lit, v->sv, sizeof(v->sv));
+                v->sv[sizeof(v->sv)-1] = 0;
                 i++; continue;
             }
             
@@ -1824,10 +1932,10 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
         if (starts_with(l, "input(")) {
             char name[256];
             if (sscanf(l, "input(%255[^)])", name) == 1) {
-                const char *keys[] = { "context" };
-                const char *vals[] = { context_str };
                 char rendered_name[256];
-                render_fstring_with_map(name, keys, vals, 1, rendered_name, sizeof(rendered_name));
+                rendered_name[0] = 0;
+                process_string(name, rendered_name, sizeof(rendered_name));
+                rendered_name[sizeof(rendered_name)-1] = 0;
                 do_input_var(rendered_name);
             }
             i++; continue;
@@ -1840,10 +1948,8 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
                 char *p = varname; while (*p && isspace((unsigned char)*p)) p++;
                 Var *v = get_var(p);
                 if (v) {
-                    const char *keys[] = { "context" };
-                    const char *vals[] = { context_str };
                     char rendered_rel[512];
-                    render_fstring_with_map(rel, keys, vals, 1, rendered_rel, sizeof(rendered_rel));
+                    process_string(rel, rendered_rel, sizeof(rendered_rel));
                     save_img_var(v, rendered_rel);
                 }
             }
@@ -1857,10 +1963,8 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
                 char *p = varname; while (*p && isspace((unsigned char)*p)) p++;
                 Var *v = get_var(p);
                 if (v) {
-                    const char *keys[] = { "context" };
-                    const char *vals[] = { context_str };
                     char rendered_rel[512];
-                    render_fstring_with_map(rel, keys, vals, 1, rendered_rel, sizeof(rendered_rel));
+                    process_string(rel, rendered_rel, sizeof(rendered_rel));
                     save_txt_var(v, rendered_rel);
                 }
             }
@@ -1871,10 +1975,8 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
         if (starts_with(l, "emit_c(")) {
             char rel[512];
             if (sscanf(l, "emit_c(\"%511[^\"]\")", rel) == 1) {
-                const char *keys[] = { "context" };
-                const char *vals[] = { context_str };
                 char rendered_rel[512];
-                render_fstring_with_map(rel, keys, vals, 1, rendered_rel, sizeof(rendered_rel));
+                process_string(rel, rendered_rel, sizeof(rendered_rel));
                 save_embedded_c_code(rendered_rel);
             }
             i++; continue;
@@ -1894,16 +1996,16 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
                 while (*a && isspace((unsigned char)*a)) a++;
                 char *end = a + strlen(a) - 1;
                 while (end > a && isspace((unsigned char)*end)) { *end = 0; end--; }
-                const char *keys[] = { "context" };
-                const char *vals[] = { context_str };
                 char out[32768];
+                out[0] = 0;
                 if (a[0] == '"' && a[strlen(a)-1] == '"') {
-                    char tmp[32768]; strncpy(tmp, a+1, sizeof(tmp)-1); tmp[sizeof(tmp)-1]=0;
+                    char tmp[32768]; 
+                    strncpy(tmp, a+1, sizeof(tmp)-1); 
+                    tmp[sizeof(tmp)-1] = 0;
                     if (tmp[strlen(tmp)-1] == '"') tmp[strlen(tmp)-1] = 0;
-                    render_fstring_with_map(tmp, keys, vals, 1, out, sizeof(out));
-                    char final_out[32768];
-                    unescape_inplace(out, final_out, sizeof(final_out));
-                    fputs(final_out, stdout);
+                    process_string(tmp, out, sizeof(out));
+                    out[sizeof(out)-1] = 0;
+                    fputs(out, stdout);
                 } else {
                     do_print_arg(a);
                 }
@@ -2066,16 +2168,16 @@ void execute_line_command(const char *l) {
             while (*a && isspace((unsigned char)*a)) a++;
             char *end = a + strlen(a) - 1;
             while (end > a && isspace((unsigned char)*end)) { *end = 0; end--; }
-            const char *keys[] = { "context" };
-            const char *vals[] = { context_str };
             char out[32768];
+            out[0] = 0;
             if (a[0] == '"' && a[strlen(a)-1] == '"') {
-                char tmp[32768]; strncpy(tmp, a+1, sizeof(tmp)-1); tmp[sizeof(tmp)-1]=0;
+                char tmp[32768]; 
+                strncpy(tmp, a+1, sizeof(tmp)-1); 
+                tmp[sizeof(tmp)-1] = 0;
                 if (tmp[strlen(tmp)-1] == '"') tmp[strlen(tmp)-1] = 0;
-                render_fstring_with_map(tmp, keys, vals, 1, out, sizeof(out));
-                char final_out[32768];
-                unescape_inplace(out, final_out, sizeof(final_out));
-                fputs(final_out, stdout);
+                process_string(tmp, out, sizeof(out));
+                out[sizeof(out)-1] = 0;
+                fputs(out, stdout);
             } else {
                 do_print_arg(a);
             }
@@ -2088,10 +2190,8 @@ void execute_line_command(const char *l) {
             char *p = varname; while (*p && isspace((unsigned char)*p)) p++;
             Var *v = get_var(p);
             if (v) {
-                const char *keys[] = { "context" };
-                const char *vals[] = { context_str };
                 char rendered_rel[512];
-                render_fstring_with_map(rel, keys, vals, 1, rendered_rel, sizeof(rendered_rel));
+                process_string(rel, rendered_rel, sizeof(rendered_rel));
                 save_txt_var(v, rendered_rel);
             } 
         }
