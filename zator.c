@@ -762,8 +762,8 @@ char* perform_http_request(const char *url, const char *method, const char *json
 }
 
 /* ---------------- Generation functions ---------------- */
-void gen_text_var(Var *out, const char *prompt, int max_length) {
-	if (debug_mode) {
+void gen_text_var(Var *out, const char *prompt, int max_length, const char *custom_endpoint) {
+    if (debug_mode) {
         printf("[DEBUG] Generating text with prompt: '%s', max_length: %d\n", prompt, max_length);
     }
     if (!out || !prompt) return;
@@ -773,7 +773,12 @@ void gen_text_var(Var *out, const char *prompt, int max_length) {
     snprintf(json_req, sizeof(json_req), "{\"prompt\": \"%s\", \"max_length\": %d}", esc_prompt, max_length);
 
     char url[512];
-    snprintf(url, sizeof(url), "%s/api/v1/generate", api_server);
+    if (custom_endpoint && strlen(custom_endpoint) > 0) {
+        snprintf(url, sizeof(url), "%s/%s", api_server, custom_endpoint);
+    } else {
+        snprintf(url, sizeof(url), "%s/api/v1/generate", api_server);
+    }
+
     char *resp = perform_http_request(url, "POST", json_req, max_length*10L);
     if (resp) {
         extern char *extract_results_text(const char *json);
@@ -784,8 +789,8 @@ void gen_text_var(Var *out, const char *prompt, int max_length) {
     }
 }
 
-void gen_img_var(Var *out, const char *prompt, int width, int height) {
-	if (debug_mode) {
+void gen_img_var(Var *out, const char *prompt, int width, int height, const char *custom_endpoint) {
+    if (debug_mode) {
         printf("[DEBUG] Generating image with prompt: '%s', width: %d, height: %d\n", prompt, width, height);
     }
     if (!out || !prompt) return;
@@ -794,7 +799,13 @@ void gen_img_var(Var *out, const char *prompt, int width, int height) {
     snprintf(json_req, sizeof(json_req), "{\"prompt\": \"%s\", \"width\": %d, \"height\": %d}", esc_prompt, width, height);
 
     char url[512];
-    snprintf(url, sizeof(url), "%s/sdapi/v1/txt2img", api_server);
+    // Логика выбора эндпоинта
+    if (custom_endpoint && strlen(custom_endpoint) > 0) {
+        snprintf(url, sizeof(url), "%s/%s", api_server, custom_endpoint);
+    } else {
+        snprintf(url, sizeof(url), "%s/sdapi/v1/txt2img", api_server);
+    }
+
     char *resp = perform_http_request(url, "POST", json_req, 0);
     if (resp) {
         extern char *extract_first_image_b64(const char *json);
@@ -1006,6 +1017,79 @@ char *extract_first_image_b64(const char *json) {
         clean[clean_len + padding_needed] = 0;
     }
     return clean;
+}
+
+static char *base64_encode(const unsigned char *data, size_t input_length) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t output_length = 4 * ((input_length + 2) / 3);
+    char *encoded_data = (char *)malloc(output_length + 1);
+    if (encoded_data == NULL) return NULL;
+
+    for (size_t i = 0, j = 0; i < input_length;) {
+        uint32_t octet_a = i < input_length ? data[i++] : 0;
+        uint32_t octet_b = i < input_length ? data[i++] : 0;
+        uint32_t octet_c = i < input_length ? data[i++] : 0;
+        uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+
+        encoded_data[j++] = table[(triple >> 18) & 0x3F];
+        encoded_data[j++] = table[(triple >> 12) & 0x3F];
+        encoded_data[j++] = (i > input_length + 1) ? '=' : table[(triple >> 6) & 0x3F];
+        encoded_data[j++] = (i > input_length) ? '=' : table[triple & 0x3F];
+    }
+    encoded_data[output_length] = '\0';
+    return encoded_data;
+}
+
+/* ---------------- Open&Save file functions ---------------- */
+void open_txt_var(Var *out, const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr, "[ERROR] Could not open text file: %s\n", filename);
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *content = (char *)malloc(fsize + 1);
+    if (content) {
+        fread(content, 1, fsize, f);
+        content[fsize] = 0;
+        out->type = VAR_STRING;
+        // Копируем содержимое в буфер переменной (с учетом вашего размера sv)
+        strncpy(out->sv, content, sizeof(out->sv) - 1);
+        out->sv[sizeof(out->sv) - 1] = '\0';
+        free(content);
+    }
+    fclose(f);
+}
+
+void open_img_var(Var *out, const char *filename) {
+    FILE *f = fopen(filename, "rb"); // Бинарное чтение
+    if (!f) {
+        fprintf(stderr, "[ERROR] Could not open image file: %s\n", filename);
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    unsigned char *buffer = (unsigned char *)malloc(fsize);
+    if (buffer) {
+        fread(buffer, 1, fsize, f);
+        char *b64_str = base64_encode(buffer, fsize);
+        
+        out->type = VAR_IMAGE;
+        if (out->img.b64) free(out->img.b64);
+        out->img.b64 = b64_str;
+        // Размеры (w, h) при простом открытии файла сложно узнать без библиотек 
+        // (stb_image), поэтому ставим 0 или заглушку.
+        out->img.w = 0; 
+        out->img.h = 0; 
+
+        free(buffer);
+    }
+    fclose(f);
 }
 
 void save_img_var(Var *v, const char *relpath) {
@@ -1878,73 +1962,138 @@ void execute_block(char **block_lines, int block_count) {
 
             Var *v = create_var_if_missing(name);
             
+            // open_txt
+            if (strstr(l, "open_txt(")) {
+                char rel[512], rendered_rel[1024];
+                char *p_start = strstr(l, "open_txt(");
+                if (p_start && sscanf(p_start, "open_txt(\"%511[^\"]\")", rel) == 1) {
+                    process_string(rel, rendered_rel, sizeof(rendered_rel));
+                    
+                    if (debug_mode) printf("[DEBUG] open_txt: Target path built: %s\n", rendered_rel);
+                    
+                    open_txt_var(v, rendered_rel); 
+                }
+                i++; continue;
+            }
+
+            // open_img
+            if (strstr(l, "open_img(")) {
+                char rel[512], rendered_rel[1024];
+                char *p_start = strstr(l, "open_img(");
+                if (p_start && sscanf(p_start, "open_img(\"%511[^\"]\")", rel) == 1) {
+                    // Строим путь для картинки
+                    process_string(rel, rendered_rel, sizeof(rendered_rel));
+                    
+                    if (debug_mode) printf("[DEBUG] open_img: Target path built: %s\n", rendered_rel);
+                    
+                    open_img_var(v, rendered_rel);
+                }
+                i++; continue;
+            }
+
 			if (strstr(l, "generate_text(")) {
-				char prompt_text[32768] = "";
-				int tokens = 25;
+                char prompt_text[32768] = "";
+                char custom_ep[512] = "";
+                int tokens = 25;
 
-				char *args = strchr(l, '(');
-				if (args) {
-					args++; 
-					while (*args && isspace((unsigned char)*args)) args++;
+                char *args = strchr(l, '(');
+                if (args) {
+                    args++; 
+                    while (*args && isspace((unsigned char)*args)) args++;
 
-					if (*args == '"') {
-						sscanf(args, "\"%[^\"]\"", prompt_text);
-						
-						char *closing_quote = strchr(args + 1, '"');
-						if (closing_quote) {
-							char *comma = strchr(closing_quote, ',');
-							if (comma) sscanf(comma + 1, "%d", &tokens);
-						}
-					} else {
-						char var_name[128];
-						if (sscanf(args, "%127[^,)]", var_name) == 1) {
-							Var *vp = get_var(var_name);
-							if (vp) strncpy(prompt_text, vp->sv, sizeof(prompt_text)-1);
-						}
-						
-						char *comma = strchr(args, ',');
-						if (comma) sscanf(comma + 1, "%d", &tokens);
-					}
-				}
-				
-				char interpolated_prompt[32768] = "";
-				process_string(prompt_text, interpolated_prompt, sizeof(interpolated_prompt));
-				gen_text_var(v, interpolated_prompt, tokens);
-				i++; continue;
+                    // prompt
+                    if (*args == '"') {
+                        sscanf(args, "\"%[^\"]\"", prompt_text);
+                        args = strchr(args + 1, '"');
+                        if (args) args++; 
+                    } else {
+                        char var_name[128];
+                        if (sscanf(args, "%127[^,)]", var_name) == 1) {
+                            Var *vp = get_var(var_name);
+                            if (vp && vp->type == VAR_STRING) {
+                                strncpy(prompt_text, vp->sv, sizeof(prompt_text)-1);
+                            }
+                        }
+                        args = strpbrk(args, ",)");
+                    }
+
+                    // tokens
+                    if (args && *args == ',') {
+                        args++;
+                        while (*args && isspace((unsigned char)*args)) args++;
+                        if (isdigit(*args)) {
+                            sscanf(args, "%d", &tokens);
+                        }
+                        args = strpbrk(args, ",)");
+                    }
+
+                    // custom endpoint
+                    if (args && *args == ',') {
+                        args++;
+                        while (*args && isspace((unsigned char)*args)) args++;
+                        if (*args == '"') {
+                            sscanf(args, "\"%[^\"]\"", custom_ep);
+                        }
+                    }
+                }
+
+                char interpolated_prompt[32768] = "";
+                process_string(prompt_text, interpolated_prompt, sizeof(interpolated_prompt));
+                gen_text_var(v, interpolated_prompt, tokens, custom_ep);
+                i++; continue;
             }
             
 			if (strstr(l, "generate_img(")) {
-				char prompt_text[32768] = "";
-				int w = 512, h = 512;
+                char prompt_text[32768] = "";
+                char custom_ep[512] = "";
+                int w = 512, h = 512;
 
-				char *args = strchr(l, '(');
-				if (args) {
-					args++;
-					while (*args && isspace((unsigned char)*args)) args++;
+                char *args = strchr(l, '(');
+                if (args) {
+                    args++;
+                    while (*args && isspace((unsigned char)*args)) args++;
 
-					if (*args == '"') {
-						sscanf(args, "\"%[^\"]\"", prompt_text);
-						char *closing_quote = strchr(args + 1, '"');
-						if (closing_quote) {
-							char *comma = strchr(closing_quote, ',');
-							if (comma) sscanf(comma + 1, " %d , %d", &w, &h);
-						}
-					} else {
-						char var_name[128];
-						if (sscanf(args, "%127[^,)]", var_name) == 1) {
-							Var *vp = get_var(var_name);
-							if (vp) strncpy(prompt_text, vp->sv, sizeof(prompt_text)-1);
-						}
-						char *comma = strchr(args, ',');
-						if (comma) sscanf(comma + 1, " %d , %d", &w, &h);
-					}
-				}
+                    if (*args == '"') {
+                        sscanf(args, "\"%[^\"]\"", prompt_text);
+                        args = strchr(args + 1, '"');
+                        if (args) args++;
+                    } else {
+                        char var_name[128];
+                        if (sscanf(args, "%127[^,)]", var_name) == 1) {
+                            Var *vp = get_var(var_name);
+                            if (vp && vp->type == VAR_STRING) {
+                                strncpy(prompt_text, vp->sv, sizeof(prompt_text)-1);
+                            }
+                        }
+                        args = strpbrk(args, ",)");
+                    }
 
-				char interpolated_prompt[32768] = "";
-				process_string(prompt_text, interpolated_prompt, sizeof(interpolated_prompt));
-				gen_img_var(v, interpolated_prompt, w, h);
-				i++; continue;
-			}
+                    if (args && *args == ',') {
+                        args++;
+                        sscanf(args, "%d", &w);
+                        args = strpbrk(args, ",)");
+                    }
+
+                    if (args && *args == ',') {
+                        args++;
+                        sscanf(args, "%d", &h);
+                        args = strpbrk(args, ",)");
+                    }
+
+                    if (args && *args == ',') {
+                        args++;
+                        while (*args && isspace((unsigned char)*args)) args++;
+                        if (*args == '"') {
+                            sscanf(args, "\"%[^\"]\"", custom_ep);
+                        }
+                    }
+                }
+
+                char interpolated_prompt[32768] = "";
+                process_string(prompt_text, interpolated_prompt, sizeof(interpolated_prompt));
+                gen_img_var(v, interpolated_prompt, w, h, custom_ep);
+                i++; continue;
+            }
             
             if (strstr(l, "request(")) {
                 char url[128], method[16], body[32768];
