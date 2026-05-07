@@ -1,3 +1,4 @@
+![logo](https://miro.medium.com/v2/resize:fit:1400/1*wCSMfWVjeK8eqdfCe4SI0w.png)
 # Zator
 
 Специализированный язык программирования для генерации и обработки AI-контента
