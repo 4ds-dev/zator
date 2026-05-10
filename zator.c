@@ -58,6 +58,7 @@ typedef struct {
     int active;
     char params[MAX_FUNC_PARAMS][128];
     int param_count;
+    char script_dir[MAX_PATH_LEN];
 } FuncDef;
 
 /* ---------------- Globals ---------------- */
@@ -75,6 +76,45 @@ int func_count = 0;
 
 Var global_return_var;
 int is_returning = 0;
+int is_breaking = 0;
+
+typedef enum {
+    EXEC_SIGNAL_NONE = 0,
+    EXEC_SIGNAL_RETURN,
+    EXEC_SIGNAL_BREAK
+} ExecSignal;
+
+typedef enum {
+    AST_NODE_EMPTY = 0,
+    AST_NODE_FUNCTION_DEF,
+    AST_NODE_RETURN,
+    AST_NODE_BREAK,
+    AST_NODE_IF,
+    AST_NODE_REPEAT,
+    AST_NODE_SIMPLE
+} AstNodeType;
+
+typedef struct {
+    AstNodeType type;
+    const char *line;
+    int line_index;
+} AstNode;
+
+typedef struct {
+    char function_name[128];
+} CallFrame;
+
+typedef struct {
+    CallFrame call_stack[64];
+    int call_depth;
+    char script_dir_stack[64][MAX_PATH_LEN];
+    int script_dir_depth;
+    char current_script_dir[MAX_PATH_LEN];
+    ExecSignal signal;
+    Var return_value;
+} RuntimeContext;
+
+RuntimeContext runtime_ctx;
 
 /* ---------------- Forward Declarations ---------------- */
 void execute_line_command(const char *l);
@@ -83,6 +123,162 @@ void process_func_call(const char *line, int call_index);
 void process_func_def(const char *line, int start_index);
 Var call_function_internal(FuncDef *func, const char *args_str);
 void execute_block(char **block_lines, int block_count);
+int starts_with(const char *s, const char *p);
+FuncDef* get_func(const char *name);
+static char *safe_strdup(const char *s);
+void free_rgba_image(RGBAImage *img);
+int eval_expression_to_var(const char *expr, Var *out);
+void process_string(char *in, char *out, size_t outlen);
+
+static int is_function_def_line(const char *line) {
+    if (!line) return 0;
+    return starts_with(line, "def ") || starts_with(line, "function ");
+}
+
+static void count_braces_in_line(const char *line, int *opens, int *closes) {
+    if (!line) return;
+    int in_string = 0;
+    int escaped = 0;
+    for (const char *p = line; *p; p++) {
+        if (escaped) {
+            escaped = 0;
+            continue;
+        }
+        if (*p == '\\') {
+            escaped = 1;
+            continue;
+        }
+        if (*p == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) continue;
+        if (*p == '{') (*opens)++;
+        else if (*p == '}') (*closes)++;
+    }
+}
+
+static int find_block_open(char **source_lines, int source_count, int start_index) {
+    for (int i = start_index; i < source_count; i++) {
+        if (source_lines[i] && strchr(source_lines[i], '{')) return i;
+    }
+    return -1;
+}
+
+static int find_matching_block_end(char **source_lines, int source_count, int open_index) {
+    int depth = 0;
+    for (int i = open_index; i < source_count; i++) {
+        int opens = 0;
+        int closes = 0;
+        count_braces_in_line(source_lines[i], &opens, &closes);
+        depth += opens;
+        depth -= closes;
+        if (depth == 0) return i;
+    }
+    return -1;
+}
+
+static AstNode ast_node_from_line(const char *line, int line_index) {
+    AstNode node;
+    node.type = AST_NODE_EMPTY;
+    node.line = line;
+    node.line_index = line_index;
+
+    if (!line || line[0] == '#') return node;
+    if (is_function_def_line(line)) node.type = AST_NODE_FUNCTION_DEF;
+    else if (starts_with(line, "return")) node.type = AST_NODE_RETURN;
+    else if (starts_with(line, "break")) node.type = AST_NODE_BREAK;
+    else if (starts_with(line, "if ")) node.type = AST_NODE_IF;
+    else if (starts_with(line, "repeat ")) node.type = AST_NODE_REPEAT;
+    else node.type = AST_NODE_SIMPLE;
+    return node;
+}
+
+static void runtime_set_signal(ExecSignal signal) {
+    runtime_ctx.signal = signal;
+    is_returning = (signal == EXEC_SIGNAL_RETURN);
+    is_breaking = (signal == EXEC_SIGNAL_BREAK);
+}
+
+static void runtime_clear_loop_signal(void) {
+    if (runtime_ctx.signal == EXEC_SIGNAL_BREAK) runtime_ctx.signal = EXEC_SIGNAL_NONE;
+    is_breaking = 0;
+}
+
+static int runtime_push_call(const char *name) {
+    if (runtime_ctx.call_depth >= (int)(sizeof(runtime_ctx.call_stack) / sizeof(runtime_ctx.call_stack[0]))) {
+        fprintf(stderr, "call: Call stack overflow while entering '%s'.\n", name ? name : "<unknown>");
+        return 0;
+    }
+    CallFrame *frame = &runtime_ctx.call_stack[runtime_ctx.call_depth++];
+    memset(frame, 0, sizeof(*frame));
+    if (name) {
+        strncpy(frame->function_name, name, sizeof(frame->function_name) - 1);
+    }
+    return 1;
+}
+
+static void runtime_pop_call(void) {
+    if (runtime_ctx.call_depth > 0) runtime_ctx.call_depth--;
+}
+
+static const char *runtime_current_script_dir(void) {
+    return runtime_ctx.current_script_dir[0] ? runtime_ctx.current_script_dir : base_dir;
+}
+
+static int runtime_push_script_dir(const char *script_dir) {
+    if (!script_dir || !*script_dir) script_dir = ".";
+    if (runtime_ctx.script_dir_depth >= (int)(sizeof(runtime_ctx.script_dir_stack) / sizeof(runtime_ctx.script_dir_stack[0]))) {
+        fprintf(stderr, "runtime: Script path stack overflow while entering '%s'.\n", script_dir);
+        return 0;
+    }
+
+    strncpy(runtime_ctx.script_dir_stack[runtime_ctx.script_dir_depth], runtime_ctx.current_script_dir,
+            sizeof(runtime_ctx.script_dir_stack[0]) - 1);
+    runtime_ctx.script_dir_stack[runtime_ctx.script_dir_depth][sizeof(runtime_ctx.script_dir_stack[0]) - 1] = 0;
+    runtime_ctx.script_dir_depth++;
+
+    strncpy(runtime_ctx.current_script_dir, script_dir, sizeof(runtime_ctx.current_script_dir) - 1);
+    runtime_ctx.current_script_dir[sizeof(runtime_ctx.current_script_dir) - 1] = 0;
+    strncpy(base_dir, runtime_ctx.current_script_dir, sizeof(base_dir) - 1);
+    base_dir[sizeof(base_dir) - 1] = 0;
+    return 1;
+}
+
+static void runtime_pop_script_dir(void) {
+    if (runtime_ctx.script_dir_depth <= 0) return;
+    runtime_ctx.script_dir_depth--;
+    strncpy(runtime_ctx.current_script_dir, runtime_ctx.script_dir_stack[runtime_ctx.script_dir_depth],
+            sizeof(runtime_ctx.current_script_dir) - 1);
+    runtime_ctx.current_script_dir[sizeof(runtime_ctx.current_script_dir) - 1] = 0;
+    strncpy(base_dir, runtime_ctx.current_script_dir, sizeof(base_dir) - 1);
+    base_dir[sizeof(base_dir) - 1] = 0;
+}
+
+static int parse_call_expr(const char *expr, char *func_name, size_t func_name_len,
+                           char *args, size_t args_len) {
+    if (!expr || !func_name || func_name_len == 0 || !args || args_len == 0) return 0;
+    func_name[0] = 0;
+    args[0] = 0;
+
+    const char *open = strchr(expr, '(');
+    const char *close = strrchr(expr, ')');
+    if (!open || !close || close < open) return 0;
+
+    const char *name_start = expr;
+    while (*name_start && isspace((unsigned char)*name_start)) name_start++;
+    size_t name_len = (size_t)(open - name_start);
+    while (name_len > 0 && isspace((unsigned char)name_start[name_len - 1])) name_len--;
+    if (name_len == 0 || name_len >= func_name_len) return 0;
+    memcpy(func_name, name_start, name_len);
+    func_name[name_len] = 0;
+
+    size_t arg_len = (size_t)(close - (open + 1));
+    if (arg_len >= args_len) arg_len = args_len - 1;
+    memcpy(args, open + 1, arg_len);
+    args[arg_len] = 0;
+    return 1;
+}
 
 /* ---------------- Utilities ---------------- */
 static char *safe_strdup(const char *s) {
@@ -111,7 +307,7 @@ int is_import_line(const char *line) {
     strncpy(trimmed_line, line, sizeof(trimmed_line) - 1);
     trimmed_line[sizeof(trimmed_line) - 1] = '\0';
     char *trimmed = trim(trimmed_line);
-    return starts_with(trimmed, "#import");
+    return starts_with(trimmed, "#import") || starts_with(trimmed, "import ");
 }
 
 Var* get_var(const char *name) {
@@ -146,6 +342,51 @@ FuncDef* get_func(const char *name) {
         if (strcmp(funcs[i].name, name) == 0) return &funcs[i];
     }
     return NULL;
+}
+
+void free_var_resources(Var *v) {
+    if (!v || v->type != VAR_IMAGE) return;
+    if (v->img.b64) {
+        free(v->img.b64);
+        v->img.b64 = NULL;
+    }
+    if (v->img.internal_img) {
+        free_rgba_image(v->img.internal_img);
+        free(v->img.internal_img);
+        v->img.internal_img = NULL;
+    }
+}
+
+void clone_var_value(Var *dst, const Var *src) {
+    char saved_name[128] = "";
+    if (!dst || !src) return;
+    strncpy(saved_name, dst->name, sizeof(saved_name) - 1);
+    free_var_resources(dst);
+    *dst = *src;
+    strncpy(dst->name, saved_name, sizeof(dst->name) - 1);
+    dst->name[sizeof(dst->name) - 1] = 0;
+
+    if (src->type == VAR_IMAGE) {
+        dst->img.b64 = src->img.b64 ? safe_strdup(src->img.b64) : NULL;
+        dst->img.internal_img = NULL;
+        if (src->img.internal_img && src->img.internal_img->pixels) {
+            dst->img.internal_img = (RGBAImage *)malloc(sizeof(RGBAImage));
+            if (dst->img.internal_img) {
+                dst->img.internal_img->w = src->img.internal_img->w;
+                dst->img.internal_img->h = src->img.internal_img->h;
+                size_t pixels_size = (size_t)dst->img.internal_img->w *
+                                     (size_t)dst->img.internal_img->h *
+                                     sizeof(uint32_t);
+                dst->img.internal_img->pixels = (uint32_t *)malloc(pixels_size);
+                if (dst->img.internal_img->pixels) {
+                    memcpy(dst->img.internal_img->pixels, src->img.internal_img->pixels, pixels_size);
+                } else {
+                    free(dst->img.internal_img);
+                    dst->img.internal_img = NULL;
+                }
+            }
+        }
+    }
 }
 
 /* ---------------- Escaping / Unescaping ---------------- */
@@ -234,6 +475,198 @@ const char *var_to_string(const Var *v, char *buf, size_t buflen) {
     return buf;
 }
 
+static int find_top_level_operator(const char *s, const char *ops) {
+    int depth = 0;
+    int in_string = 0;
+    int escaped = 0;
+    int found = -1;
+    for (int i = (int)strlen(s) - 1; i >= 0; i--) {
+        char c = s[i];
+        if (escaped) {
+            escaped = 0;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = 1;
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) continue;
+        if (c == ')') depth++;
+        else if (c == '(') depth--;
+        else if (depth == 0 && strchr(ops, c)) {
+            if ((c == '+' || c == '-') && (i == 0 || strchr("+-*/(,", s[i - 1]))) continue;
+            found = i;
+            break;
+        }
+    }
+    return found;
+}
+
+static int has_wrapping_parens(const char *s) {
+    size_t len = strlen(s);
+    if (len < 2 || s[0] != '(' || s[len - 1] != ')') return 0;
+    int depth = 0;
+    int in_string = 0;
+    int escaped = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (escaped) {
+            escaped = 0;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = 1;
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) continue;
+        if (c == '(') depth++;
+        else if (c == ')') {
+            depth--;
+            if (depth == 0 && i != len - 1) return 0;
+        }
+    }
+    return depth == 0;
+}
+
+static int split_top_level_args(const char *args, char parts[][4096], int max_parts) {
+    int count = 0;
+    int depth = 0;
+    int in_string = 0;
+    int escaped = 0;
+    size_t start = 0;
+    size_t len = args ? strlen(args) : 0;
+
+    if (!args || !*args) return 0;
+    for (size_t i = 0; i <= len; i++) {
+        char c = args[i];
+        if (escaped) {
+            escaped = 0;
+        } else if (c == '\\') {
+            escaped = 1;
+        } else if (c == '"') {
+            in_string = !in_string;
+        } else if (!in_string) {
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+        }
+
+        if ((c == ',' && depth == 0 && !in_string) || c == 0) {
+            if (count >= max_parts) return count;
+            size_t part_len = i - start;
+            while (part_len > 0 && isspace((unsigned char)args[start])) {
+                start++;
+                part_len--;
+            }
+            while (part_len > 0 && isspace((unsigned char)args[start + part_len - 1])) part_len--;
+            if (part_len >= 4096) part_len = 4095;
+            memcpy(parts[count], args + start, part_len);
+            parts[count][part_len] = 0;
+            if (part_len > 0) count++;
+            start = i + 1;
+        }
+    }
+    return count;
+}
+
+int eval_expression_to_var(const char *expr, Var *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    out->type = VAR_STRING;
+    if (!expr) return 0;
+
+    char buf[32768];
+    strncpy(buf, expr, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+    char *e = trim(buf);
+    size_t len = strlen(e);
+    if (len == 0) return 1;
+
+    if (has_wrapping_parens(e)) {
+        e[len - 1] = 0;
+        return eval_expression_to_var(e + 1, out);
+    }
+
+    int op_pos = find_top_level_operator(e, "+-");
+    if (op_pos < 0) op_pos = find_top_level_operator(e, "*/");
+    if (op_pos > 0) {
+        char left_expr[32768], right_expr[32768];
+        strncpy(left_expr, e, (size_t)op_pos);
+        left_expr[op_pos] = 0;
+        strncpy(right_expr, e + op_pos + 1, sizeof(right_expr) - 1);
+        right_expr[sizeof(right_expr) - 1] = 0;
+        Var left, right;
+        if (!eval_expression_to_var(left_expr, &left) || !eval_expression_to_var(right_expr, &right)) return 0;
+        if (e[op_pos] == '+' && (left.type == VAR_STRING || right.type == VAR_STRING)) {
+            char lb[32768], rb[32768];
+            out->type = VAR_STRING;
+            snprintf(out->sv, sizeof(out->sv), "%s%s",
+                     var_to_string(&left, lb, sizeof(lb)),
+                     var_to_string(&right, rb, sizeof(rb)));
+        } else {
+            int li = left.type == VAR_INT ? left.iv : atoi(left.sv);
+            int ri = right.type == VAR_INT ? right.iv : atoi(right.sv);
+            out->type = VAR_INT;
+            if (e[op_pos] == '+') out->iv = li + ri;
+            else if (e[op_pos] == '-') out->iv = li - ri;
+            else if (e[op_pos] == '*') out->iv = li * ri;
+            else out->iv = ri != 0 ? li / ri : 0;
+        }
+        free_var_resources(&left);
+        free_var_resources(&right);
+        return 1;
+    }
+
+    if (len >= 2 && e[0] == '"' && e[len - 1] == '"') {
+        e[len - 1] = 0;
+        out->type = VAR_STRING;
+        process_string(e + 1, out->sv, sizeof(out->sv));
+        return 1;
+    }
+
+    char fname[128], fargs[4096];
+    if (parse_call_expr(e, fname, sizeof(fname), fargs, sizeof(fargs))) {
+        FuncDef *f = get_func(fname);
+        if (f) {
+            Var ret = call_function_internal(f, fargs);
+            clone_var_value(out, &ret);
+            free_var_resources(&ret);
+            return 1;
+        }
+    }
+
+    int is_number = 1;
+    char *p = e;
+    if (*p == '-' || *p == '+') p++;
+    if (!isdigit((unsigned char)*p)) is_number = 0;
+    while (*p) {
+        if (!isdigit((unsigned char)*p)) { is_number = 0; break; }
+        p++;
+    }
+    if (is_number) {
+        out->type = VAR_INT;
+        out->iv = atoi(e);
+        return 1;
+    }
+
+    Var *v = get_var(e);
+    if (v) {
+        clone_var_value(out, v);
+        return 1;
+    }
+
+    out->type = VAR_STRING;
+    strncpy(out->sv, e, sizeof(out->sv) - 1);
+    return 1;
+}
+
 void unescape_string(const char *in, char *out, size_t maxlen) {
     size_t i = 0;
 
@@ -279,10 +712,10 @@ void render_fstring(const char *fmt, char *out, size_t outlen) {
 
         if (fmt[i] == '{') {
             size_t j = i + 1;
-            char key[128];
+            char key[4096];
             int ki = 0;
 
-            while (fmt[j] && fmt[j] != '}' && ki < 127) {
+            while (fmt[j] && fmt[j] != '}' && ki < (int)sizeof(key) - 1) {
                 key[ki++] = fmt[j++];
             }
 
@@ -294,13 +727,14 @@ void render_fstring(const char *fmt, char *out, size_t outlen) {
                 char *kend = kstart + strlen(kstart) - 1;
                 while (kend > kstart && isspace((unsigned char)*kend)) { *kend = 0; kend--; }
 
-                Var *v = get_var(kstart);
-                if (v) {
+                Var val_var;
+                if (eval_expression_to_var(kstart, &val_var)) {
                     char valbuf[32768];
-                    const char *val = var_to_string(v, valbuf, sizeof(valbuf));
+                    const char *val = var_to_string(&val_var, valbuf, sizeof(valbuf));
                     for (size_t k = 0; val[k] && oi + 1 < outlen; k++) {
                         out[oi++] = val[k];
                     }
+                    free_var_resources(&val_var);
                 }
                 i = j + 1;
             } else {
@@ -398,6 +832,133 @@ void normalize_relpath(char *dst, size_t dstlen, const char *rel) {
     }
 
     dst[j] = '\0';
+}
+
+static int is_absolute_path(const char *path) {
+    if (!path || !*path) return 0;
+    if (path[0] == '/' || path[0] == '\\') return 1;
+    return isalpha((unsigned char)path[0]) && path[1] == ':';
+}
+
+static int append_path_part(char *dst, size_t dstlen, size_t *pos, const char *part) {
+    if (!dst || !pos || !part) return 0;
+    for (size_t i = 0; part[i]; i++) {
+        if (*pos + 1 >= dstlen) return 0;
+        dst[(*pos)++] = part[i];
+    }
+    dst[*pos] = 0;
+    return 1;
+}
+
+static int normalize_portable_path(char *dst, size_t dstlen, const char *path) {
+    if (!dst || dstlen == 0) return 0;
+    dst[0] = 0;
+    if (!path || !*path) return 0;
+
+    char tmp[MAX_PATH_LEN];
+    size_t ti = 0;
+    for (size_t i = 0; path[i] && ti + 1 < sizeof(tmp); i++) {
+        char c = path[i] == '\\' ? '/' : path[i];
+        tmp[ti++] = c;
+    }
+    tmp[ti] = 0;
+    if (path[ti] != 0) return 0;
+
+    char prefix[MAX_PATH_LEN] = "";
+    size_t start = 0;
+    int absolute = 0;
+
+    if (isalpha((unsigned char)tmp[0]) && tmp[1] == ':') {
+        prefix[0] = tmp[0];
+        prefix[1] = ':';
+        prefix[2] = 0;
+        start = 2;
+        if (tmp[start] == '/') {
+            strcat(prefix, "/");
+            while (tmp[start] == '/') start++;
+        }
+        absolute = 1;
+    } else if (tmp[0] == '/') {
+        strcpy(prefix, "/");
+        while (tmp[start] == '/') start++;
+        absolute = 1;
+    }
+
+    const char *segments[256];
+    int seg_count = 0;
+    char *cursor = tmp + start;
+    while (*cursor) {
+        while (*cursor == '/') cursor++;
+        if (!*cursor) break;
+        char *seg = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        if (*cursor) *cursor++ = 0;
+
+        if (strcmp(seg, ".") == 0 || seg[0] == 0) {
+            continue;
+        } else if (strcmp(seg, "..") == 0) {
+            if (seg_count > 0 && strcmp(segments[seg_count - 1], "..") != 0) {
+                seg_count--;
+            } else if (!absolute && seg_count < (int)(sizeof(segments) / sizeof(segments[0]))) {
+                segments[seg_count++] = seg;
+            }
+        } else if (seg_count < (int)(sizeof(segments) / sizeof(segments[0]))) {
+            segments[seg_count++] = seg;
+        } else {
+            return 0;
+        }
+    }
+
+    size_t pos = 0;
+    if (!append_path_part(dst, dstlen, &pos, prefix)) return 0;
+    for (int i = 0; i < seg_count; i++) {
+        if (pos > 0 && dst[pos - 1] != '/') {
+            if (pos + 1 >= dstlen) return 0;
+            dst[pos++] = '/';
+            dst[pos] = 0;
+        }
+        if (!append_path_part(dst, dstlen, &pos, segments[i])) return 0;
+    }
+    if (pos == 0) {
+        if (!append_path_part(dst, dstlen, &pos, absolute ? prefix : ".")) return 0;
+    }
+    return 1;
+}
+
+int build_resource_path(char *dst, size_t dstlen, const char *relpath) {
+    if (!dst || dstlen == 0) return 0;
+    dst[0] = 0;
+    if (!relpath || !*relpath) {
+        fprintf(stderr, "[ERROR] Empty resource path.\n");
+        return 0;
+    }
+
+    char rendered[MAX_PATH_LEN];
+    if (is_absolute_path(relpath)) {
+        snprintf(rendered, sizeof(rendered), "%s", relpath);
+        rendered[sizeof(rendered) - 1] = 0;
+    } else {
+        normalize_relpath(rendered, sizeof(rendered), relpath);
+    }
+    if (!rendered[0]) {
+        fprintf(stderr, "[ERROR] Invalid resource path: %s\n", relpath);
+        return 0;
+    }
+
+    char combined[MAX_PATH_LEN];
+    if (is_absolute_path(rendered)) {
+        snprintf(combined, sizeof(combined), "%s", rendered);
+    } else {
+        snprintf(combined, sizeof(combined), "%s/%s", runtime_current_script_dir(), rendered);
+    }
+    combined[sizeof(combined) - 1] = 0;
+
+    if (!normalize_portable_path(dst, dstlen, combined)) {
+        fprintf(stderr, "[ERROR] Could not normalize resource path: %s\n", relpath);
+        dst[0] = 0;
+        return 0;
+    }
+    return 1;
 }
 
 /* ---------------- Exec command ---------------- */
@@ -522,7 +1083,7 @@ int decode_png_from_memory(unsigned char *in_data, size_t in_len, RGBAImage *out
          png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
          return 0;
     }
-    for (int y = 0; y < height; y++) {
+    for (png_uint_32 y = 0; y < height; y++) {
         row_pointers[y] = (png_bytep)(out_img->pixels + y * width);
     }
     png_read_image(png_ptr, row_pointers);
@@ -556,6 +1117,7 @@ void png_mem_write_data(png_structp png_ptr, png_bytep data, png_size_t length) 
 }
 
 void png_mem_flush_data(png_structp png_ptr) {
+    (void)png_ptr;
 }
 
 int encode_png_to_memory(RGBAImage *in_img, unsigned char **out_data, size_t *out_len) {
@@ -1042,25 +1604,48 @@ static char *base64_encode(const unsigned char *data, size_t input_length) {
 
 /* ---------------- Open&Save file functions ---------------- */
 void open_txt_var(Var *out, const char *filename) {
-    FILE *f = fopen(filename, "r");
+    if (!out) return;
+
+    char abs[MAX_PATH_LEN];
+    if (!build_resource_path(abs, sizeof(abs), filename)) return;
+
+    FILE *f = fopen(abs, "rb");
     if (!f) {
-        fprintf(stderr, "[ERROR] Could not open text file: %s\n", filename);
+        fprintf(stderr, "[ERROR] Could not open text file: %s (%s)\n", abs, strerror(errno));
         return;
     }
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fprintf(stderr, "[ERROR] Could not seek text file: %s\n", abs);
+        fclose(f);
+        return;
+    }
     long fsize = ftell(f);
+    if (fsize < 0) {
+        fprintf(stderr, "[ERROR] Could not determine text file size: %s\n", abs);
+        fclose(f);
+        return;
+    }
     fseek(f, 0, SEEK_SET);
 
     char *content = (char *)malloc(fsize + 1);
-    if (content) {
-        fread(content, 1, fsize, f);
-        content[fsize] = 0;
-        out->type = VAR_STRING;
-        // Копируем содержимое в буфер переменной (с учетом вашего размера sv)
-        strncpy(out->sv, content, sizeof(out->sv) - 1);
-        out->sv[sizeof(out->sv) - 1] = '\0';
-        free(content);
+    if (!content) {
+        fprintf(stderr, "[ERROR] Out of memory reading text file: %s\n", abs);
+        fclose(f);
+        return;
     }
+    size_t nread = fread(content, 1, (size_t)fsize, f);
+    if (nread != (size_t)fsize && ferror(f)) {
+        fprintf(stderr, "[ERROR] Could not read text file: %s\n", abs);
+        free(content);
+        fclose(f);
+        return;
+    }
+    content[nread] = 0;
+    out->type = VAR_STRING;
+        // Копируем содержимое в буфер переменной (с учетом вашего размера sv)
+    strncpy(out->sv, content, sizeof(out->sv) - 1);
+    out->sv[sizeof(out->sv) - 1] = '\0';
+    free(content);
     fclose(f);
 }
 
@@ -1090,6 +1675,75 @@ void open_img_var(Var *out, const char *filename) {
         free(buffer);
     }
     fclose(f);
+}
+
+void open_img_resource_var(Var *out, const char *filename) {
+    if (!out) return;
+
+    char abs[MAX_PATH_LEN];
+    if (!build_resource_path(abs, sizeof(abs), filename)) return;
+
+    FILE *f = fopen(abs, "rb");
+    if (!f) {
+        fprintf(stderr, "[ERROR] Could not open image file: %s (%s)\n", abs, strerror(errno));
+        return;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fprintf(stderr, "[ERROR] Could not seek image file: %s\n", abs);
+        fclose(f);
+        return;
+    }
+    long fsize = ftell(f);
+    if (fsize <= 0) {
+        fprintf(stderr, "[ERROR] Empty or unreadable image file: %s\n", abs);
+        fclose(f);
+        return;
+    }
+    fseek(f, 0, SEEK_SET);
+
+    unsigned char *buffer = (unsigned char *)malloc((size_t)fsize);
+    if (!buffer) {
+        fprintf(stderr, "[ERROR] Out of memory reading image file: %s\n", abs);
+        fclose(f);
+        return;
+    }
+    size_t nread = fread(buffer, 1, (size_t)fsize, f);
+    fclose(f);
+    if (nread != (size_t)fsize) {
+        fprintf(stderr, "[ERROR] Could not read full image file: %s\n", abs);
+        free(buffer);
+        return;
+    }
+
+    char *b64_str = base64_encode(buffer, nread);
+    if (!b64_str) {
+        fprintf(stderr, "[ERROR] Could not encode image file: %s\n", abs);
+        free(buffer);
+        return;
+    }
+
+    RGBAImage *decoded = (RGBAImage *)calloc(1, sizeof(RGBAImage));
+    if (decoded && !decode_png_from_memory(buffer, nread, decoded)) {
+        free(decoded);
+        decoded = NULL;
+    }
+
+    if (out->img.b64) free(out->img.b64);
+    if (out->img.internal_img) {
+        free_rgba_image(out->img.internal_img);
+        free(out->img.internal_img);
+    }
+
+    out->type = VAR_IMAGE;
+    out->img.b64 = b64_str;
+    out->img.internal_img = decoded;
+    out->img.w = decoded ? decoded->w : 0;
+    out->img.h = decoded ? decoded->h : 0;
+    out->img.saved = 1;
+    strncpy(out->img.path, filename, sizeof(out->img.path) - 1);
+    out->img.path[sizeof(out->img.path) - 1] = 0;
+
+    free(buffer);
 }
 
 void save_img_var(Var *v, const char *relpath) {
@@ -1552,55 +2206,88 @@ void process_scale_to(const char *line) {
 }
 
 /* ---------------- Function Definition with Parameters ---------------- */
-void process_func_def(const char *line, int start_index) {
+static void clear_func_body(FuncDef *func) {
+    if (!func) return;
+    for (int i = 0; i < func->num_lines; i++) {
+        free(func->lines[i]);
+        func->lines[i] = NULL;
+    }
+    func->num_lines = 0;
+}
+
+static int register_func_def_from_block(char **source_lines, int source_count, int start_index, int *end_index) {
+    if (!source_lines || start_index < 0 || start_index >= source_count || !source_lines[start_index]) {
+        return 0;
+    }
+
+    const char *line = source_lines[start_index];
     char func_name[128], params_str[512];
     int has_params = 0;
-    
-    if (sscanf(line, "def %127[^ (](%511[^)])", func_name, params_str) == 2) {
-        has_params = 1;
+
+    func_name[0] = 0;
+    params_str[0] = 0;
+    const char *header = line + (starts_with(line, "function ") ? 8 : 3);
+    while (*header && isspace((unsigned char)*header)) header++;
+    const char *paren = strchr(header, '(');
+    if (paren) {
+        size_t name_len = (size_t)(paren - header);
+        while (name_len > 0 && isspace((unsigned char)header[name_len - 1])) name_len--;
+        if (name_len >= sizeof(func_name)) name_len = sizeof(func_name) - 1;
+        memcpy(func_name, header, name_len);
+        func_name[name_len] = 0;
+
+        const char *close = strchr(paren + 1, ')');
+        if (close) {
+            size_t params_len = (size_t)(close - (paren + 1));
+            if (params_len >= sizeof(params_str)) params_len = sizeof(params_str) - 1;
+            memcpy(params_str, paren + 1, params_len);
+            params_str[params_len] = 0;
+            has_params = 1;
+        }
     } else if (sscanf(line, "def %127s", func_name) == 1) {
         has_params = 0;
-        params_str[0] = 0;
-    } else {
+    }
+
+    if (func_name[0] == 0 || (paren && !strchr(paren + 1, ')'))) {
         fprintf(stderr, "def: Invalid syntax at line %d: %s\n", start_index + 1, line);
-        return;
+        return 0;
     }
     
-    int j = start_index + 1;
-    while (j < line_count && strcmp(lines[j], "{") != 0) j++;
-    if (j >= line_count) {
+    int open_index = find_block_open(source_lines, source_count, start_index);
+    if (open_index < 0) {
         fprintf(stderr, "def: Missing '{' for function '%s'\n", func_name);
-        return;
-    }
-    j++;
-    
-    int block_start = j;
-    int block_end = block_start;
-    int depth = 1;
-    for (int k = block_start; k < line_count; ++k) {
-        if (strcmp(lines[k], "{") == 0) depth++;
-        else if (strcmp(lines[k], "}") == 0) {
-            depth--;
-            if (depth == 0) {
-                block_end = k;
-                break;
-            }
-        }
+        return 0;
     }
     
-    if (block_end <= block_start) {
+    int block_start = open_index + 1;
+    int block_end = find_matching_block_end(source_lines, source_count, open_index);
+    
+    if (block_end < block_start) {
         fprintf(stderr, "def: Empty or invalid function block for '%s'\n", func_name);
-        return;
+        return 0;
     }
     
-    if (func_count >= MAX_VARS) {
+    FuncDef *func = get_func(func_name);
+    int is_update = (func != NULL);
+    if (func && func->active) {
+        fprintf(stderr, "def: Cannot redefine active function '%s'.\n", func_name);
+        return 0;
+    }
+    if (!func && func_count >= MAX_VARS) {
         fprintf(stderr, "def: Too many functions defined.\n");
-        return;
+        return 0;
     }
     
-    FuncDef *func = &funcs[func_count++];
+    if (!func) {
+        func = &funcs[func_count++];
+        memset(func, 0, sizeof(*func));
+    } else {
+        clear_func_body(func);
+    }
     strncpy(func->name, func_name, sizeof(func->name) - 1);
     func->name[sizeof(func->name) - 1] = 0;
+    strncpy(func->script_dir, runtime_current_script_dir(), sizeof(func->script_dir) - 1);
+    func->script_dir[sizeof(func->script_dir) - 1] = 0;
     func->num_lines = 0;
     func->active = 0;
     func->param_count = 0;
@@ -1623,11 +2310,22 @@ void process_func_def(const char *line, int start_index) {
     
     for (int k = block_start; k < block_end; ++k) {
         if (func->num_lines < MAX_FUNC_LINES - 1) {
-            func->lines[func->num_lines++] = safe_strdup(lines[k]);
+            func->lines[func->num_lines++] = safe_strdup(source_lines[k]);
         }
     }
     
-    printf("def: Registered function '%s' with %d parameters\n", func_name, func->param_count);
+    if (end_index) *end_index = block_end;
+    if (!is_update) {
+        printf("def: Registered function '%s' with %d parameters\n", func_name, func->param_count);
+    } else if (debug_mode) {
+        printf("[DEBUG] def: Updated function '%s' with %d parameters\n", func_name, func->param_count);
+    }
+    return 1;
+}
+
+void process_func_def(const char *line, int start_index) {
+    (void)line;
+    register_func_def_from_block(lines, line_count, start_index, NULL);
 }
 
 /* ---------------- Call Function Internal (Core logic) ---------------- */
@@ -1636,72 +2334,26 @@ Var call_function_internal(FuncDef *func, const char *args_str) {
     memset(&ret_val, 0, sizeof(Var));
     ret_val.type = VAR_STRING;
 
-    if (func->active) {
-        fprintf(stderr, "call: Recursive call to function '%s' detected.\n", func->name);
+    if (!runtime_push_call(func->name)) {
         return ret_val;
     }
 
-    char *arg_values[MAX_FUNC_PARAMS] = {NULL};
+    Var *arg_values = (Var *)calloc(MAX_FUNC_PARAMS, sizeof(Var));
     int arg_count = 0;
+    if (!arg_values) {
+        fprintf(stderr, "call: Out of memory preparing arguments for '%s'.\n", func->name);
+        runtime_pop_call();
+        return ret_val;
+    }
 
     if (args_str && strlen(args_str) > 0) {
-        char args_copy[4096];
-        strncpy(args_copy, args_str, sizeof(args_copy) - 1);
-
-        char *token = strtok(args_copy, ",");
-        while (token && arg_count < MAX_FUNC_PARAMS) {
-            char *p = token;
-            while (*p && isspace((unsigned char)*p)) p++;
-            char *end = p + strlen(p) - 1;
-            while (end > p && isspace((unsigned char)*end)) { *end = 0; end--; }
-
-            if (strlen(p) > 0) {
-                char resolved_arg[32768] = {0};
-                
-                // If argument is quoted string, remove quotes and keep as-is
-                if (*p == '"' && end > p && *end == '"') {
-                    p++;
-                    *end = 0;
-                    arg_values[arg_count] = safe_strdup(p);
-                } else {
-                    // Check if it's a variable reference (not a number literal)
-                    int is_var_ref = 1;
-                    char *check_p = p;
-                    if (*check_p == '-' || *check_p == '+') check_p++;
-                    if (isdigit((unsigned char)*check_p)) {
-                        // Could be a number, check if all characters are digits
-                        is_var_ref = 0;
-                        while (*check_p && isdigit((unsigned char)*check_p)) check_p++;
-                        if (*check_p) is_var_ref = 1; // Not a pure number, might be variable
-                    }
-                    
-                    // Try to resolve as variable
-                    if (is_var_ref) {
-                        Var *var_ref = get_var(p);
-                        if (var_ref) {
-                            // Get the variable value
-                            if (var_ref->type == VAR_INT) {
-                                snprintf(resolved_arg, sizeof(resolved_arg), "%d", var_ref->iv);
-                            } else if (var_ref->type == VAR_STRING) {
-                                strncpy(resolved_arg, var_ref->sv, sizeof(resolved_arg) - 1);
-                            } else if (var_ref->type == VAR_IMAGE) {
-                                if (var_ref->img.saved && var_ref->img.path[0]) {
-                                    strncpy(resolved_arg, var_ref->img.path, sizeof(resolved_arg) - 1);
-                                }
-                            }
-                            arg_values[arg_count] = safe_strdup(resolved_arg);
-                        } else {
-                            // Not a variable, pass as-is
-                            arg_values[arg_count] = safe_strdup(p);
-                        }
-                    } else {
-                        // It's a number, pass as-is
-                        arg_values[arg_count] = safe_strdup(p);
-                    }
-                }
-                arg_count++;
+        char parts[MAX_FUNC_PARAMS][4096];
+        arg_count = split_top_level_args(args_str, parts, MAX_FUNC_PARAMS);
+        for (int i = 0; i < arg_count; i++) {
+            if (!eval_expression_to_var(parts[i], &arg_values[i])) {
+                arg_values[i].type = VAR_STRING;
+                strncpy(arg_values[i].sv, parts[i], sizeof(arg_values[i].sv) - 1);
             }
-            token = strtok(NULL, ",");
         }
     }
 
@@ -1709,13 +2361,22 @@ Var call_function_internal(FuncDef *func, const char *args_str) {
         fprintf(stderr, "call: Function '%s' expects %d parameters, got %d.\n", 
                 func->name, func->param_count, arg_count);
         for (int i = 0; i < arg_count; i++) {
-            if (arg_values[i]) free(arg_values[i]);
+            free_var_resources(&arg_values[i]);
         }
+        free(arg_values);
+        runtime_pop_call();
         return ret_val;
     }
 
-    Var old_param_values[MAX_FUNC_PARAMS];
+    Var *old_param_values = (Var *)calloc(MAX_FUNC_PARAMS, sizeof(Var));
     int has_old_param[MAX_FUNC_PARAMS] = {0};
+    if (!old_param_values) {
+        fprintf(stderr, "call: Out of memory saving parameters for '%s'.\n", func->name);
+        for (int i = 0; i < arg_count; i++) free_var_resources(&arg_values[i]);
+        free(arg_values);
+        runtime_pop_call();
+        return ret_val;
+    }
 
     for (int i = 0; i < func->param_count; i++) {
         Var *existing = get_var(func->params[i]);
@@ -1728,38 +2389,54 @@ Var call_function_internal(FuncDef *func, const char *args_str) {
 
         Var *v = create_var_if_missing(func->params[i]);
         if (v) {
-            memset(v->sv, 0, sizeof(v->sv));
-            v->type = VAR_STRING;
-            v->iv = 0;
-            
-            if (arg_values[i]) {
-                char rendered_arg[32768];
-                process_string(arg_values[i], rendered_arg, sizeof(rendered_arg));
-                strncpy(v->sv, rendered_arg, sizeof(v->sv) - 1);
-                v->sv[sizeof(v->sv) - 1] = 0;
-            }
+            clone_var_value(v, &arg_values[i]);
         }
     }
 
     func->active = 1;
+    if (!runtime_push_script_dir(func->script_dir[0] ? func->script_dir : runtime_current_script_dir())) {
+        func->active = 0;
+        runtime_pop_call();
+        for (int i = 0; i < func->param_count; i++) {
+            Var *v = get_var(func->params[i]);
+            if (v && has_old_param[i]) {
+                *v = old_param_values[i];
+            } else if (v) {
+                v->sv[0] = 0;
+            }
+        }
+        for (int i = 0; i < arg_count; i++) {
+            free_var_resources(&arg_values[i]);
+        }
+        free(old_param_values);
+        free(arg_values);
+        return ret_val;
+    }
     
     // Protect return values stack
     int saved_is_returning = is_returning;
     Var saved_return = global_return_var;
 
     is_returning = 0;
+    is_breaking = 0;
+    runtime_ctx.signal = EXEC_SIGNAL_NONE;
     memset(&global_return_var, 0, sizeof(Var));
     global_return_var.type = VAR_STRING;
 
     // Run the function block using standard interpreter mechanisms
     execute_block(func->lines, func->num_lines);
 
-    ret_val = global_return_var;
+    clone_var_value(&ret_val, &global_return_var);
+    free_var_resources(&global_return_var);
 
     // Restore
     is_returning = saved_is_returning;
+    is_breaking = 0;
     global_return_var = saved_return;
+    runtime_ctx.signal = saved_is_returning ? EXEC_SIGNAL_RETURN : EXEC_SIGNAL_NONE;
     func->active = 0;
+    runtime_pop_script_dir();
+    runtime_pop_call();
 
     for (int i = 0; i < func->param_count; i++) {
         Var *v = get_var(func->params[i]);
@@ -1768,8 +2445,10 @@ Var call_function_internal(FuncDef *func, const char *args_str) {
         } else if (v) {
             v->sv[0] = 0;
         }
-        if (arg_values[i]) free(arg_values[i]);
+        free_var_resources(&arg_values[i]);
     }
+    free(old_param_values);
+    free(arg_values);
 
     if (debug_mode) {
         printf("call: Executed function '%s' with %d arguments\n", func->name, arg_count);
@@ -1780,12 +2459,15 @@ Var call_function_internal(FuncDef *func, const char *args_str) {
 /* ---------------- Function Call with Parameters (Backwards compatible) ---------------- */
 void process_func_call(const char *line, int call_index) {
     char func_name[128], args_str[4096];
-    int has_args = 0;
     
-    if (sscanf(line, "call %127[^ (](%4095[^)])", func_name, args_str) == 2) {
-        has_args = 1;
-    } else if (sscanf(line, "call %127s", func_name) == 1) {
-        has_args = 0;
+    const char *expr = line + 4;
+    while (*expr && isspace((unsigned char)*expr)) expr++;
+    if (strchr(expr, '(')) {
+        if (!parse_call_expr(expr, func_name, sizeof(func_name), args_str, sizeof(args_str))) {
+            fprintf(stderr, "call: Invalid syntax at line %d: %s\n", call_index + 1, line);
+            return;
+        }
+    } else if (sscanf(expr, "%127s", func_name) == 1) {
         args_str[0] = 0;
     } else {
         fprintf(stderr, "call: Invalid syntax at line %d: %s\n", call_index + 1, line);
@@ -1807,58 +2489,40 @@ void execute_line_command(const char *l);
 
 void execute_block(char **block_lines, int block_count) {
     int i = 0;
-    while (i < block_count && !is_returning) {
+    while (i < block_count && !is_returning && !is_breaking) {
         char *l = block_lines[i];
-        if (!l || l[0] == '#') { i++; continue; }
+        AstNode node = ast_node_from_line(l, i);
+        if (node.type == AST_NODE_EMPTY) { i++; continue; }
         
         // Skip function definitions (already processed)
-        if (starts_with(l, "def ")) {
-            int j = i + 1;
-            while (j < block_count && strcmp(block_lines[j], "{") != 0) j++;
-            if (j < block_count) {
-                j++;
-                int depth = 1;
-                for (int k = j; k < block_count; ++k) {
-                    if (strcmp(block_lines[k], "{") == 0) depth++;
-                    else if (strcmp(block_lines[k], "}") == 0) {
-                        depth--;
-                        if (depth == 0) {
-                            i = k + 1;
-                            break;
-                        }
-                    }
-                }
+        if (node.type == AST_NODE_FUNCTION_DEF) {
+            int block_end = i;
+            if (register_func_def_from_block(block_lines, block_count, i, &block_end)) {
+                i = block_end + 1;
+            } else {
+                i++;
             }
             continue;
         }
 
         // Return command
-        if (starts_with(l, "return")) {
+        if (node.type == AST_NODE_RETURN) {
             char val[4096] = "";
             if (sscanf(l, "return %4095[^\n]", val) == 1) {
-                char *v = trim(val);
+                free_var_resources(&global_return_var);
                 memset(&global_return_var, 0, sizeof(Var));
-                global_return_var.type = VAR_STRING; 
-                if (v && strlen(v) > 0) {
-                    if (v[0] == '"') {
-                        char tmp[4096];
-                        strncpy(tmp, v+1, strlen(v)-2);
-                        tmp[strlen(v)-2] = 0;
-                        process_string(tmp, global_return_var.sv, sizeof(global_return_var.sv));
-                    } else if (isdigit((unsigned char)v[0]) || v[0] == '-') {
-                        global_return_var.type = VAR_INT;
-                        global_return_var.iv = atoi(v);
-                    } else {
-                        Var *ref = get_var(v);
-                        if (ref) {
-                            global_return_var = *ref;
-                        } else {
-                            strncpy(global_return_var.sv, v, sizeof(global_return_var.sv)-1);
-                        }
-                    }
+                if (!eval_expression_to_var(val, &global_return_var)) {
+                    global_return_var.type = VAR_STRING;
                 }
             }
-            is_returning = 1;
+            global_return_var.name[0] = 0;
+            runtime_ctx.return_value = global_return_var;
+            runtime_set_signal(EXEC_SIGNAL_RETURN);
+            i++; continue;
+        }
+
+        if (node.type == AST_NODE_BREAK) {
+            runtime_set_signal(EXEC_SIGNAL_BREAK);
             i++; continue;
         }
 
@@ -1868,11 +2532,9 @@ void execute_block(char **block_lines, int block_count) {
             !starts_with(l, "input(") && !starts_with(l, "emit_c(") && !starts_with(l, "call ")) {
             char fname_call[128] = {0};
             char args_call[4096] = {0};
-            int parsed = sscanf(l, "%127[^ (](%4095[^)])", fname_call, args_call);
-            if (parsed >= 1) {
+            if (parse_call_expr(l, fname_call, sizeof(fname_call), args_call, sizeof(args_call))) {
                 FuncDef *f = get_func(fname_call);
-                if (f && strchr(l, '(') && l[strlen(l)-1] == ')') {
-                    if (parsed == 1) args_call[0] = '\0';
+                if (f) {
                     call_function_internal(f, args_call);
                     i++; continue;
                 }
@@ -1942,18 +2604,14 @@ void execute_block(char **block_lines, int block_count) {
                 char *e = trim(expr);
                 char fname[128] = {0};
                 char fargs[4096] = {0};
-                int parsed = sscanf(e, "%127[^ (](%4095[^)])", fname, fargs);
-                if (parsed >= 1) {
+                if (parse_call_expr(e, fname, sizeof(fname), fargs, sizeof(fargs))) {
                     FuncDef *f = get_func(fname);
-                    if (f && strchr(e, '(') && e[strlen(e)-1] == ')') {
-                        if (parsed == 1) fargs[0] = '\0';
+                    if (f) {
                         Var ret = call_function_internal(f, fargs);
                         Var *v = create_var_if_missing(name);
                         if (v) {
-                            char saved_name[128];
-                            strcpy(saved_name, v->name);
-                            *v = ret;
-                            strcpy(v->name, saved_name);
+                            clone_var_value(v, &ret);
+                            free_var_resources(&ret);
                         }
                         i++; continue;
                     }
@@ -1986,7 +2644,7 @@ void execute_block(char **block_lines, int block_count) {
                     
                     if (debug_mode) printf("[DEBUG] open_img: Target path built: %s\n", rendered_rel);
                     
-                    open_img_var(v, rendered_rel);
+                    open_img_resource_var(v, rendered_rel);
                 }
                 i++; continue;
             }
@@ -2157,6 +2815,15 @@ void execute_block(char **block_lines, int block_count) {
                 v->iv = ival;
                 i++; continue;
             }
+
+            if (expr[0]) {
+                Var evaluated;
+                if (eval_expression_to_var(expr, &evaluated)) {
+                    clone_var_value(v, &evaluated);
+                    free_var_resources(&evaluated);
+                    i++; continue;
+                }
+            }
             
             v->type = VAR_STRING;
             v->sv[0] = 0;
@@ -2226,21 +2893,17 @@ void execute_block(char **block_lines, int block_count) {
         // print
         if (starts_with(l, "print(")) {
             char arg[4096];
-            if (sscanf(l, "print(%4095[^)])", arg) == 1) {
+            char call_name[128];
+            if (parse_call_expr(l, call_name, sizeof(call_name), arg, sizeof(arg)) && strcmp(call_name, "print") == 0) {
                 char *a = arg;
                 while (*a && isspace((unsigned char)*a)) a++;
                 char *end = a + strlen(a) - 1;
                 while (end > a && isspace((unsigned char)*end)) { *end = 0; end--; }
-                char out[32768];
-                out[0] = 0;
-                if (a[0] == '"' && a[strlen(a)-1] == '"') {
-                    char tmp[32768]; 
-                    strncpy(tmp, a+1, sizeof(tmp)-1); 
-                    tmp[sizeof(tmp)-1] = 0;
-                    if (tmp[strlen(tmp)-1] == '"') tmp[strlen(tmp)-1] = 0;
-                    process_string(tmp, out, sizeof(out));
-                    out[sizeof(out)-1] = 0;
-                    fputs(out, stdout);
+                Var value;
+                if (eval_expression_to_var(a, &value)) {
+                    char out[32768];
+                    fputs(var_to_string(&value, out, sizeof(out)), stdout);
+                    free_var_resources(&value);
                 } else {
                     do_print_arg(a);
                 }
@@ -2359,26 +3022,20 @@ void execute_block(char **block_lines, int block_count) {
         if (starts_with(l, "repeat ")) {
             int times = 0;
             if (sscanf(l, "repeat %d", &times) >= 1 && times > 0) {
-                int j = i + 1;
-                if (strchr(l, '{') == NULL) {
-                    while (j < block_count && strcmp(block_lines[j], "{") != 0) j++;
-                    if (j >= block_count) { i++; continue; }
-                    j++;
-                }
-                int block_start = j;
-                int block_end = block_start;
-                int depth = 1;
-                for (int k = block_start; k < block_count; ++k) {
-                    if (strcmp(block_lines[k], "{") == 0) depth++;
-                    else if (strcmp(block_lines[k], "}") == 0) { depth--; if (depth == 0) { block_end = k; break; } }
-                }
+                int open_index = strchr(l, '{') ? i : find_block_open(block_lines, block_count, i + 1);
+                if (open_index < 0) { i++; continue; }
+                int block_start = open_index + 1;
+                int block_end = find_matching_block_end(block_lines, block_count, open_index);
                 if (block_end <= block_start) { i++; continue; }
                 bool broken = false;
                 for (int t = 0; t < times && !broken; ++t) {
-                    for (int k = block_start; k < block_end; ++k) {
-                        if (!block_lines[k]) continue;
-                        if (strcmp(block_lines[k], "break") == 0) { broken = true; break; }
-                        execute_line_command(block_lines[k]);
+                    execute_block(&block_lines[block_start], block_end - block_start);
+                    if (runtime_ctx.signal == EXEC_SIGNAL_BREAK || is_breaking) {
+                        broken = true;
+                        runtime_clear_loop_signal();
+                    }
+                    if (runtime_ctx.signal == EXEC_SIGNAL_RETURN || is_returning) {
+                        broken = true;
                     }
                 }
                 i = block_end + 1;
@@ -2386,25 +3043,28 @@ void execute_block(char **block_lines, int block_count) {
             }
         }
         
-        execute_line_command(l);
         i++;
     }
 }
 
 void parse_and_run_script_recursive(const char *script_path, const char *base_dir_for_this_script) {
+    (void)base_dir_for_this_script;
     FILE *f = fopen(script_path, "r");
     if (!f) { fprintf(stderr, "Cannot open script: %s\n", script_path); return; }
-    
-    char original_base_dir[MAX_PATH_LEN];
-    strncpy(original_base_dir, base_dir, sizeof(original_base_dir) - 1);
-    original_base_dir[sizeof(original_base_dir) - 1] = '\0';
-    
+
     char temp_path[MAX_PATH_LEN];
     strncpy(temp_path, script_path, sizeof(temp_path) - 1);
     temp_path[sizeof(temp_path) - 1] = '\0';
     char *script_dir = dirname(temp_path);
-    strncpy(base_dir, script_dir, sizeof(base_dir) - 1);
-    base_dir[sizeof(base_dir) - 1] = '\0';
+    char normalized_script_dir[MAX_PATH_LEN];
+    if (!normalize_portable_path(normalized_script_dir, sizeof(normalized_script_dir), script_dir)) {
+        strncpy(normalized_script_dir, script_dir, sizeof(normalized_script_dir) - 1);
+        normalized_script_dir[sizeof(normalized_script_dir) - 1] = 0;
+    }
+    if (!runtime_push_script_dir(normalized_script_dir)) {
+        fclose(f);
+        return;
+    }
     
     char buf[MAX_LINE];
     int initial_line_count = line_count;
@@ -2419,11 +3079,23 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
     for (int i = initial_line_count; i < line_count; i++) {
         if (is_import_line(lines[i])) {
             char imported_file[MAX_PATH_LEN];
-            if (sscanf(lines[i], "#import \"%[^\"]\"", imported_file) == 1) {
+            if (sscanf(lines[i], "#import \"%[^\"]\"", imported_file) == 1 ||
+                sscanf(lines[i], "import \"%[^\"]\"", imported_file) == 1) {
                 char full_import_path[MAX_PATH_LEN];
-                snprintf(full_import_path, sizeof(full_import_path), "%s/%s", base_dir, imported_file);
+                if (!build_resource_path(full_import_path, sizeof(full_import_path), imported_file)) {
+                    fprintf(stderr, "Invalid import path in script: %s, line: %s\n", script_path, lines[i]);
+                    free(lines[i]);
+                    lines[i] = NULL;
+                    continue;
+                }
                 printf("Importing: %s\n", full_import_path);
-                parse_and_run_script_recursive(full_import_path, base_dir);
+                int imported_line_start = line_count;
+                parse_and_run_script_recursive(full_import_path, runtime_current_script_dir());
+                for (int k = imported_line_start; k < line_count; k++) {
+                    free(lines[k]);
+                    lines[k] = NULL;
+                }
+                line_count = imported_line_start;
             } else {
                 fprintf(stderr, "Invalid import format in script: %s, line: %s\n", script_path, lines[i]);
             }
@@ -2449,25 +3121,10 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
         char *l = lines[i];
         if (!l || l[0] == '#') { i++; continue; }
         
-        if (starts_with(l, "def ")) {
-            process_func_def(l, i);
-            
-            int j = i + 1;
-            while (j < line_count && strcmp(lines[j], "{") != 0) j++;
-            if (j < line_count) {
-                j++;
-                int depth = 1;
-                for (int k = j; k < line_count; ++k) {
-                    if (strcmp(lines[k], "{") == 0) depth++;
-                    else if (strcmp(lines[k], "}") == 0) {
-                        depth--;
-                        if (depth == 0) {
-                            i = k + 1;
-                            break;
-                        }
-                    }
-                }
-            }
+        if (is_function_def_line(l)) {
+            int block_end = i;
+            if (register_func_def_from_block(lines, line_count, i, &block_end)) i = block_end + 1;
+            else i++;
             continue;
         }
         i++;
@@ -2475,52 +3132,15 @@ void parse_and_run_script_recursive(const char *script_path, const char *base_di
     
     // PASS 2: Execute code in order using unified execute_block compiler logic
     execute_block(&lines[initial_line_count], line_count - initial_line_count);
-    
-    strncpy(base_dir, original_base_dir, sizeof(base_dir) - 1);
-    base_dir[sizeof(base_dir) - 1] = '\0';
+
+    runtime_pop_script_dir();
 }
 
 void execute_line_command(const char *l) { 
+    char *single_line[1];
     if (!l) return;
-    if (starts_with(l, "print(")) {
-        char arg[4096];
-        if (sscanf(l, "print(%4095[^)])", arg) == 1) {
-            char *a = arg;
-            while (*a && isspace((unsigned char)*a)) a++;
-            char *end = a + strlen(a) - 1;
-            while (end > a && isspace((unsigned char)*end)) { *end = 0; end--; }
-            char out[32768];
-            out[0] = 0;
-            if (a[0] == '"' && a[strlen(a)-1] == '"') {
-                char tmp[32768]; 
-                strncpy(tmp, a+1, sizeof(tmp)-1); 
-                tmp[sizeof(tmp)-1] = 0;
-                if (tmp[strlen(tmp)-1] == '"') tmp[strlen(tmp)-1] = 0;
-                process_string(tmp, out, sizeof(out));
-                out[sizeof(out)-1] = 0;
-                fputs(out, stdout);
-            } else {
-                do_print_arg(a);
-            }
-        }
-        return;
-    }
-    if (starts_with(l, "save_txt(")) {
-        char varname[128], rel[512];
-        if (sscanf(l, "save_txt(%127[^,], \"%511[^\"]\")", varname, rel) == 2) {
-            char *p = varname; while (*p && isspace((unsigned char)*p)) p++;
-            Var *v = get_var(p);
-            if (v) {
-                char rendered_rel[512];
-                process_string(rel, rendered_rel, sizeof(rendered_rel));
-                save_txt_var(v, rendered_rel);
-            } 
-        }
-        return;
-    }
-    if (starts_with(l, "break")) {
-        return;
-    }
+    single_line[0] = (char *)l;
+    execute_block(single_line, 1);
 }
 
 /* ---------------- Entry point ---------------- */
@@ -2549,6 +3169,8 @@ int main(int argc, char **argv) {
         printf("[DEBUG] Running in debug mode\n");
     }
 
+    memset(&runtime_ctx, 0, sizeof(runtime_ctx));
+
     char temp_path[MAX_PATH_LEN];
     strncpy(temp_path, script_file, sizeof(temp_path) - 1);
     temp_path[sizeof(temp_path) - 1] = '\0';
@@ -2557,17 +3179,7 @@ int main(int argc, char **argv) {
     base_dir[sizeof(base_dir) - 1] = '\0';
     parse_and_run_script_recursive(script_file, base_dir);
     for (int i = 0; i < var_count; ++i) {
-        if (vars[i].type == VAR_IMAGE) {
-            if (vars[i].img.b64) {
-                free(vars[i].img.b64);
-                vars[i].img.b64 = NULL;
-            }
-            if (vars[i].img.internal_img) {
-                free_rgba_image(vars[i].img.internal_img);
-                free(vars[i].img.internal_img);
-                vars[i].img.internal_img = NULL;
-            }
-        }
+        free_var_resources(&vars[i]);
     }
     for (int i = 0; i < func_count; i++) {
         for (int j = 0; j < funcs[i].num_lines; j++) {
