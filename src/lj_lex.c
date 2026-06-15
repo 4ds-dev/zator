@@ -303,6 +303,13 @@ static LexToken lex_scan(LexState *ls, TValue *tv)
 	lex_savenext(ls);
       } while (lj_char_isident(ls->c));
       s = lj_parse_keepstr(ls, ls->sb.b, sbuflen(&ls->sb));
+
+      /*
+      if (s->len == 6 && strcmp(strdata(s), "import") == 0) {
+        s = lj_parse_keepstr(ls, "require", 7);
+      }
+      */
+
       setstrV(ls->L, tv, s);
       if (s->reserved > 0)  /* Reserved word? */
 	return TK_OFS + s->reserved;
@@ -510,6 +517,11 @@ void lj_lex_init(lua_State *L)
     GCstr *s = lj_str_newz(L, tokennames[i]);
     fixstring(s);  /* Reserved words are never collected. */
     s->reserved = (uint8_t)(i+1);
+  }
+  {
+    GCstr *s_def = lj_str_newz(L, "def");
+    fixstring(s_def); 
+    s_def->reserved = (uint8_t)(TK_function - TK_OFS);
   }
 }
 

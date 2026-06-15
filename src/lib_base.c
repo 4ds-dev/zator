@@ -460,6 +460,57 @@ LJLIB_CF(dofile)
   return (int)(L->top - L->base) - 1;
 }
 
+#include <string.h>
+#include <stdio.h>
+
+LJLIB_CF(import)
+{
+  const char *path = luaL_checkstring(L, 1);
+  char full_path[2048];
+  lua_Debug ar;
+  int resolved = 0;
+
+  /* 1. Определяем путь относительно вызывающего скрипта */
+  if (lua_getstack(L, 1, &ar) && lua_getinfo(L, "S", &ar) && ar.source[0] == '@') {
+    const char *src = ar.source + 1;
+    const char *path_sep = strrchr(src, '/');
+    if (path_sep) {
+      size_t len = (size_t)(path_sep - src + 1);
+      snprintf(full_path, sizeof(full_path), "%.*s%s", (int)len, src, path);
+      resolved = 1;
+    }
+  }
+  if (!resolved) {
+    snprintf(full_path, sizeof(full_path), "%s", path);
+  }
+
+  /* 2. Защита от повторного прогона (кэш _LOADED) */
+  lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+  lua_getfield(L, -1, path);
+  if (!lua_isnil(L, -1)) {
+    lua_pop(L, 2);
+    return 0; /* Уже загружали, выходим */
+  }
+  lua_pop(L, 2);
+
+  /* 3. Загружаем файл */
+  if (luaL_loadfile(L, full_path) != LUA_OK) {
+    return lua_error(L);
+  }
+  
+  /* 4. Просто выполняем код целиком в общем процессе */
+  /* Передаем 0 в nresults, чтобы очистить стек и ничего не затирать */
+  lua_call(L, 0, 0); 
+
+  /* 5. Помечаем в кэше, что файл успешно выполнен */
+  lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+  lua_pushboolean(L, 1);
+  lua_setfield(L, -2, path);
+  lua_pop(L, 1);
+
+  return 0;
+}
+
 /* -- Base library: GC control -------------------------------------------- */
 
 LJLIB_CF(gcinfo)
@@ -704,6 +755,52 @@ LUALIB_API int luaopen_base(lua_State *L)
   newproxy_weaktable(L);  /* top-2. */
   LJ_LIB_REG(L, "_G", base);
   LJ_LIB_REG(L, LUA_COLIBNAME, coroutine);
+
+  /* Встраиваем f-строки прямо в глобальное окружение при старте VM */
+  if (luaL_dostring(L,
+    "local function format(_, str)\n"
+    "   local function scan_using(scanner, arg, searched)\n"
+    "      local i = 1\n"
+    "      repeat\n"
+    "         local name, value = scanner(arg, i)\n"
+    "         if name == searched then return true, value end\n"
+    "         i = i + 1\n"
+    "      until name == nil\n"
+    "      return false\n"
+    "   end\n"
+    "   local function snd(_, b) return b end\n"
+    "   local outer_env = _ENV and (snd(scan_using(debug.getlocal, 3, '_ENV')) or "
+    "snd(scan_using(debug.getupvalue, debug.getinfo(2, 'f').func, '_ENV')) or _ENV) or getfenv(2)\n"
+    "   return (str:gsub('%b{}', function(block)\n"
+    "      local code, fmt = block:match('{(.*):(%%.*)}')\n"
+    "      code = code or block:match('{(.*)}')\n"
+    "      local exp_env = {}\n"
+    "      setmetatable(exp_env, { __index = function(_, k)\n"
+    "         local level = 6\n"
+    "         while true do\n"
+    "            local funcInfo = debug.getinfo(level, 'f')\n"
+    "            if not funcInfo then break end\n"
+    "            local ok, value = scan_using(debug.getupvalue, funcInfo.func, k)\n"
+    "            if ok then return value end\n"
+    "            ok, value = scan_using(debug.getlocal, level + 1, k)\n"
+    "            if ok then return value end\n"
+    "            level = level + 1\n"
+    "         end\n"
+    "         return rawget(outer_env, k)\n"
+    "      end })\n"
+    "      local fn, err = load('return '..code, 'expression `'..code..'`', 't', exp_env)\n"
+    "      if fn then\n"
+    "         return fmt and string.format(fmt, fn()) or tostring(fn())\n"
+    "      else\n"
+    "         error(err, 0)\n"
+    "      end\n"
+    "   end))\n"
+    "end\n"
+    "f = setmetatable({}, { __call = format })\n"
+  ) != LUA_OK) {
+    return lua_error(L);
+  }
+
   return 2;
 }
 
