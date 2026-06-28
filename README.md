@@ -1,5 +1,3 @@
-The VSCode Marketplace extension is deprecated. Please use the version from the [OpenVSX Registry](https://open-vsx.org/extension/4ds/zator-vscode).
-
 ![logo](https://miro.medium.com/v2/resize\:fit:1400/1*wCSMfWVjeK8eqdfCe4SI0w.png)
 
 # Zator
