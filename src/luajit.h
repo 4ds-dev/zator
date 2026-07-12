@@ -30,11 +30,11 @@
 
 #include "lua.h"
 
-#define LUAJIT_VERSION		"Zator 0.0.4-luajit"
+#define LUAJIT_VERSION		"LuaJIT 2.1.1783773675"
 #define LUAJIT_VERSION_NUM	20199  /* Deprecated. */
-#define LUAJIT_VERSION_SYM	luaJIT_version_2_1_ROLLING
-#define LUAJIT_COPYRIGHT	"the AI-Slop generation optimizer"
-#define LUAJIT_URL		"https://zapor.2bd.net/"
+#define LUAJIT_VERSION_SYM	luaJIT_version_2_1_1783773675
+#define LUAJIT_COPYRIGHT	"Copyright (C) 2005-2026 Mike Pall"
+#define LUAJIT_URL		"https://luajit.org/"
 
 /* Modes for luaJIT_setmode. */
 #define LUAJIT_MODE_MASK	0x00ff
